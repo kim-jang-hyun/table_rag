@@ -1,0 +1,6 @@
+qdrant-client
+python-dotenv
+pypdf
+torch
+sentence-transformers
+pymupdf
