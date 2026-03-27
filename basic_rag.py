@@ -2,7 +2,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List
 
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
@@ -18,32 +18,136 @@ class Chunk:
     chunk_id: str
     page: int
     text: str
+    source_type: str
 
 
-def _load_pdf_pages(pdf_path: Path) -> List[Tuple[int, str]]:
-    # Prefer PyMuPDF for better Korean text extraction on many PDFs.
-    # Fallback to pypdf if PyMuPDF isn't available.
+def _normalize_cell(value) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
+def _table_to_text(table_rows: List[List[str]], table_title: str = "") -> str:
+    if not table_rows:
+        return ""
+
+    header = table_rows[0]
+    body = table_rows[1:]
+    lines: List[str] = []
+    lines.append("TABLE")
+    if table_title:
+        lines.append(f"title: {table_title}")
+    lines.append(f"columns: {', '.join(header)}")
+
+    for row_idx, row in enumerate(body, start=1):
+        cells: List[str] = []
+        for col_name, cell in zip(header, row):
+            if not cell:
+                continue
+            cells.append(f"{col_name}={cell}")
+        row_text = " | ".join(cells) if cells else "(empty row)"
+        lines.append(f"row{row_idx}: {row_text}")
+
+    return "\n".join(lines).strip()
+
+
+def _extract_page_table_texts(page) -> List[str]:
+    table_texts: List[str] = []
+    try:
+        finder = page.find_tables()
+        tables = getattr(finder, "tables", [])
+        for table in tables:
+            raw_rows = table.extract() or []
+            rows: List[List[str]] = []
+            for raw_row in raw_rows:
+                rows.append([_normalize_cell(cell) for cell in raw_row])
+            if not rows:
+                continue
+            table_title = _find_table_title(page, table)
+            table_text = _table_to_text(rows, table_title=table_title)
+            if table_text:
+                table_texts.append(table_text)
+    except Exception:
+        # If table extraction fails for a page, continue with non-table chunks.
+        pass
+    return table_texts
+
+
+def _find_table_title(page, table) -> str:
+    # Heuristic: pick the closest non-empty text block above the table.
+    try:
+        blocks = page.get_text("blocks") or []
+        table_bbox = getattr(table, "bbox", None)
+        if not table_bbox:
+            return ""
+
+        table_top = float(table_bbox[1])
+        candidates: List[tuple] = []
+        for block in blocks:
+            # PyMuPDF block format: (x0, y0, x1, y1, text, block_no, block_type, ...)
+            if len(block) < 5:
+                continue
+            x0, y0, x1, y1, text = block[:5]
+            content = " ".join(str(text).split())
+            if not content:
+                continue
+            # Keep only text above (or touching) table top with small tolerance.
+            if float(y1) <= table_top + 2.0:
+                # Prefer compact heading-like lines over long paragraphs.
+                if len(content) <= 120:
+                    distance = table_top - float(y1)
+                    candidates.append((distance, content))
+
+        if not candidates:
+            return ""
+
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+    except Exception:
+        return ""
+
+
+def _load_pdf_sections(pdf_path: Path) -> List[Chunk]:
+    # Prefer PyMuPDF for robust layout/table extraction.
     try:
         import fitz  # PyMuPDF
 
         doc = fitz.open(str(pdf_path))
-        pages: List[Tuple[int, str]] = []
-        for i in range(doc.page_count):
-            page = doc.load_page(i)
-            text = page.get_text("text") or ""
-            text = " ".join(text.split())
-            pages.append((i + 1, text))
-        return pages
-    except Exception:
-        from pypdf import PdfReader
+        chunks: List[Chunk] = []
+        for page_index in range(doc.page_count):
+            page_no = page_index + 1
+            page = doc.load_page(page_index)
 
-        reader = PdfReader(str(pdf_path))
-        pages: List[Tuple[int, str]] = []
-        for i, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            text = " ".join(text.split())
-            pages.append((i, text))
-        return pages
+            page_text = page.get_text("text") or ""
+            page_text = " ".join(page_text.split())
+            if page_text:
+                for j, piece in enumerate(_chunk_text(page_text), start=1):
+                    if piece:
+                        chunks.append(
+                            Chunk(
+                                chunk_id=f"p{page_no:04d}_t{j:03d}",
+                                page=page_no,
+                                text=piece,
+                                source_type="text",
+                            )
+                        )
+
+            table_texts = _extract_page_table_texts(page)
+            for k, table_text in enumerate(table_texts, start=1):
+                chunks.append(
+                    Chunk(
+                        chunk_id=f"p{page_no:04d}_tb{k:03d}",
+                        page=page_no,
+                        text=table_text,
+                        source_type="table",
+                    )
+                )
+        return chunks
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to extract PDF sections with PyMuPDF. "
+            "Install/verify pymupdf and check whether the PDF is readable."
+        ) from exc
 
 
 def _chunk_text(text: str, *, chunk_size: int = 1000, chunk_overlap: int = 150) -> Iterable[str]:
@@ -60,26 +164,13 @@ def _chunk_text(text: str, *, chunk_size: int = 1000, chunk_overlap: int = 150) 
         start = max(0, end - chunk_overlap)
 
 
-def _build_chunks(pages: List[Tuple[int, str]]) -> List[Chunk]:
-    chunks: List[Chunk] = []
-    for page_num, page_text in pages:
-        if not page_text:
-            continue
-        for j, piece in enumerate(_chunk_text(page_text), start=1):
-            if not piece:
-                continue
-            chunk_id = f"p{page_num:04d}_c{j:03d}"
-            chunks.append(Chunk(chunk_id=chunk_id, page=page_num, text=piece))
-    return chunks
-
-
 def _get_qdrant_client() -> QdrantClient:
     url = os.environ.get("QDRANT_URL", "").strip()
     api_key = os.environ.get("QDRANT_API_KEY", "").strip()
     if not url:
-        raise RuntimeError("Missing QDRANT_URL in .env")
+        raise RuntimeError("Missing QDRANT_URL (set in .env or Streamlit secrets)")
     if not api_key or api_key == "PASTE_YOUR_QDRANT_API_KEY_HERE":
-        raise RuntimeError("Missing QDRANT_API_KEY in .env")
+        raise RuntimeError("Missing QDRANT_API_KEY (set in .env or Streamlit secrets)")
     return QdrantClient(url=url, api_key=api_key)
 
 
@@ -103,13 +194,18 @@ def _embed_texts(embed_model, texts: List[str]) -> List[List[float]]:
     return vecs.tolist() if hasattr(vecs, "tolist") else vecs
 
 
-def ingest_pdf_to_qdrant(*, pdf_path: Path, collection: str = DEFAULT_COLLECTION) -> None:
-    pages = _load_pdf_pages(pdf_path)
-    chunks = _build_chunks(pages)
+def ingest_pdf_to_qdrant(
+    *,
+    pdf_path: Path,
+    collection: str = DEFAULT_COLLECTION,
+    embed_model=None,
+) -> None:
+    chunks = _load_pdf_sections(pdf_path)
     if not chunks:
         raise RuntimeError("No text extracted from PDF (is it scanned 이미지 PDF?)")
 
-    embed_model, _ = _load_models()
+    if embed_model is None:
+        embed_model, _ = _load_models()
     vectors = _embed_texts(embed_model, [c.text for c in chunks])
     vector_size = len(vectors[0])
 
@@ -127,6 +223,7 @@ def ingest_pdf_to_qdrant(*, pdf_path: Path, collection: str = DEFAULT_COLLECTION
             "doc": pdf_path.name,
             "page": chunk.page,
             "chunk_id": chunk.chunk_id,
+            "source_type": chunk.source_type,
             "text": chunk.text,
         }
         points.append(PointStruct(id=idx, vector=vector, payload=payload))
@@ -141,9 +238,14 @@ def search_and_rerank(
     collection: str = DEFAULT_COLLECTION,
     qdrant_top_k: int = 20,
     rerank_top_k: int = 5,
+    embed_model=None,
+    reranker=None,
+    qdrant=None,
 ):
-    embed_model, reranker = _load_models()
-    qdrant = _get_qdrant_client()
+    if embed_model is None or reranker is None:
+        embed_model, reranker = _load_models()
+    if qdrant is None:
+        qdrant = _get_qdrant_client()
 
     qvec = _embed_texts(embed_model, [query])[0]
     resp = qdrant.query_points(
@@ -164,6 +266,7 @@ def search_and_rerank(
                 "score": float(h.score),
                 "page": payload.get("page"),
                 "chunk_id": payload.get("chunk_id"),
+                "source_type": payload.get("source_type", "text"),
                 "text": payload.get("text", ""),
             }
         )
@@ -203,33 +306,11 @@ def main():
 
     if ingest_on_start:
         print("Ingesting PDF into Qdrant (bge-m3)...")
-        pages = _load_pdf_pages(pdf_path)
-        chunks = _build_chunks(pages)
-        if not chunks:
-            raise RuntimeError("No text extracted from PDF (is it scanned 이미지 PDF?)")
-
-        vectors = _embed_texts(embed_model, [c.text for c in chunks])
-        vector_size = len(vectors[0])
-
-        if qdrant.collection_exists(collection_name=collection):
-            qdrant.delete_collection(collection_name=collection)
-        qdrant.create_collection(
-            collection_name=collection,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+        ingest_pdf_to_qdrant(
+            pdf_path=pdf_path,
+            collection=collection,
+            embed_model=embed_model,
         )
-
-        points: List[PointStruct] = []
-        for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
-            payload = {
-                "doc": pdf_path.name,
-                "page": chunk.page,
-                "chunk_id": chunk.chunk_id,
-                "text": chunk.text,
-            }
-            points.append(PointStruct(id=idx, vector=vector, payload=payload))
-
-        qdrant.upsert(collection_name=collection, points=points)
-        print(f"Upserted {len(points)} chunks into Qdrant collection '{collection}'.")
     else:
         print("Skipping ingest (INGEST_ON_START=0). Using existing Qdrant collection.")
 
@@ -241,41 +322,25 @@ def main():
         if user_q.lower() in {"exit", "quit"}:
             break
 
-        qvec = _embed_texts(embed_model, [user_q])[0]
-        resp = qdrant.query_points(
-            collection_name=collection,
-            query=qvec,
-            limit=20,
-            with_payload=True,
+        top = search_and_rerank(
+            query=user_q,
+            collection=collection,
+            qdrant_top_k=20,
+            rerank_top_k=5,
+            embed_model=embed_model,
+            reranker=reranker,
+            qdrant=qdrant,
         )
-        hits = resp.points
-        if not hits:
+        if not top:
             print("A> 검색 결과가 없습니다.")
             continue
 
-        docs = []
-        for h in hits:
-            payload = h.payload or {}
-            docs.append(
-                {
-                    "score": float(h.score),
-                    "page": payload.get("page"),
-                    "chunk_id": payload.get("chunk_id"),
-                    "text": payload.get("text", ""),
-                }
-            )
-
-        pairs = [[user_q, d["text"]] for d in docs]
-        rerank_scores = reranker.predict(pairs)
-        for d, s in zip(docs, rerank_scores):
-            d["rerank_score"] = float(s)
-
-        docs.sort(key=lambda x: x["rerank_score"], reverse=True)
-        top = docs[:5]
-
         print("\nA> (rerank 상위 5개 청크)")
         for i, r in enumerate(top, start=1):
-            print(f"\n[{i}] page={r['page']} chunk_id={r['chunk_id']} rerank={r['rerank_score']:.4f}")
+            print(
+                f"\n[{i}] page={r['page']} chunk_id={r['chunk_id']} "
+                f"type={r['source_type']} rerank={r['rerank_score']:.4f}"
+            )
             print(r["text"])
 
 

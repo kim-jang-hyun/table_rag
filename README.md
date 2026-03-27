@@ -28,9 +28,10 @@ python basic_rag.py
 
 ### 동작
 
-- 1) PDF 텍스트 추출 → 청크 분할
-- 2) `BAAI/bge-m3` 로 청크 임베딩
-- 3) Qdrant 컬렉션 생성 후 upsert
-- 4) 질문 임베딩으로 Qdrant Top-K 검색
-- 5) `BAAI/bge-reranker-v2-m3` 로 재정렬 후 상위 결과 출력
+- 1) PDF에서 본문/테이블 추출
+- 2) 본문은 일반 청킹, 테이블은 행/열 구조를 보존한 텍스트로 변환
+- 3) `BAAI/bge-m3` 로 청크 임베딩
+- 4) Qdrant 컬렉션 생성 후 upsert (`source_type: text|table` payload 포함)
+- 5) 질문 임베딩으로 Qdrant Top-K 검색
+- 6) `BAAI/bge-reranker-v2-m3` 로 재정렬 후 상위 결과 출력
 
