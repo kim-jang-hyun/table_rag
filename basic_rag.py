@@ -5,12 +5,14 @@ from pathlib import Path
 from typing import Iterable, List
 
 from dotenv import load_dotenv
+from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, PointStruct, VectorParams
 
 
 DEFAULT_PDF = "[POSCO홀딩스]임원ㆍ주요주주특정증권등소유상황보고서(2026.03.10).pdf"
 DEFAULT_COLLECTION = "posco_holdings_report_2026_03_10"
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 
 
 @dataclass(frozen=True)
@@ -174,6 +176,13 @@ def _get_qdrant_client() -> QdrantClient:
     return QdrantClient(url=url, api_key=api_key)
 
 
+def _get_openai_client() -> OpenAI:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY (set in .env)")
+    return OpenAI(api_key=api_key)
+
+
 def _load_models():
     # Lazy import to keep startup errors clearer.
     # Using sentence-transformers avoids optional deps that require MSVC build tools on Windows.
@@ -280,6 +289,51 @@ def search_and_rerank(
     return docs[:rerank_top_k]
 
 
+def _build_context_from_docs(docs: List[dict]) -> str:
+    lines: List[str] = []
+    for i, doc in enumerate(docs, start=1):
+        lines.append(
+            f"[{i}] page={doc.get('page')} chunk_id={doc.get('chunk_id')} "
+            f"type={doc.get('source_type')} rerank={doc.get('rerank_score', 0.0):.4f}"
+        )
+        lines.append(doc.get("text", ""))
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def answer_with_openai(
+    *,
+    query: str,
+    docs: List[dict],
+    openai_client: OpenAI,
+    model: str = DEFAULT_OPENAI_MODEL,
+) -> str:
+    context = _build_context_from_docs(docs)
+    if not context:
+        return "검색된 컨텍스트가 없어 답변을 생성할 수 없습니다."
+
+    system_prompt = (
+        "당신은 문서 QA 어시스턴트입니다. 반드시 제공된 컨텍스트 범위 안에서만 답하세요. "
+        "근거가 부족하면 모른다고 말하고, 추측하지 마세요. "
+        "가능하면 답변 끝에 근거 청크 번호([1], [2]...)를 표시하세요."
+    )
+    user_prompt = (
+        f"질문:\n{query}\n\n"
+        f"컨텍스트:\n{context}\n\n"
+        "요청: 질문에 한국어로 간결하고 정확하게 답하세요."
+    )
+
+    response = openai_client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+    )
+    return (response.output_text or "").strip()
+
+
 def main():
     # Help Windows terminals display Korean properly when possible.
     try:
@@ -292,6 +346,7 @@ def main():
 
     pdf_path = Path(os.environ.get("PDF_PATH", DEFAULT_PDF))
     collection = os.environ.get("QDRANT_COLLECTION", DEFAULT_COLLECTION)
+    openai_model = os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
     ingest_on_start = os.environ.get("INGEST_ON_START", "1").strip().lower() not in {"0", "false", "no"}
 
     if not pdf_path.exists():
@@ -303,6 +358,7 @@ def main():
     # Load models once and reuse for interactive Q&A.
     embed_model, reranker = _load_models()
     qdrant = _get_qdrant_client()
+    openai_client = _get_openai_client()
 
     if ingest_on_start:
         print("Ingesting PDF into Qdrant (bge-m3)...")
@@ -342,6 +398,15 @@ def main():
                 f"type={r['source_type']} rerank={r['rerank_score']:.4f}"
             )
             print(r["text"])
+
+        llm_answer = answer_with_openai(
+            query=user_q,
+            docs=top,
+            openai_client=openai_client,
+            model=openai_model,
+        )
+        print("\nA> (OpenAI 답변)")
+        print(llm_answer or "답변 생성에 실패했습니다.")
 
 
 if __name__ == "__main__":
