@@ -170,9 +170,9 @@ def _get_qdrant_client() -> QdrantClient:
     url = os.environ.get("QDRANT_URL", "").strip()
     api_key = os.environ.get("QDRANT_API_KEY", "").strip()
     if not url:
-        raise RuntimeError("Missing QDRANT_URL (set in .env or Streamlit secrets)")
+        raise RuntimeError("Missing QDRANT_URL (set in .env)")
     if not api_key or api_key == "PASTE_YOUR_QDRANT_API_KEY_HERE":
-        raise RuntimeError("Missing QDRANT_API_KEY (set in .env or Streamlit secrets)")
+        raise RuntimeError("Missing QDRANT_API_KEY (set in .env)")
     return QdrantClient(url=url, api_key=api_key)
 
 
