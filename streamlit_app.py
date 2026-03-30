@@ -106,6 +106,66 @@ def _ask(
     return {"answer": answer, "docs": docs}
 
 
+def _ask_llm_only(*, question: str, openai_model: str) -> Dict[str, Any]:
+    _, openai_client = _clients_cached()
+    system_prompt = (
+        "당신은 유능한 AI 어시스턴트입니다. 아래 질문에 한국어로 간결하고 정확하게 답하세요. "
+        "문서 컨텍스트나 검색 결과는 제공되지 않았습니다. 확실하지 않으면 모른다고 말하세요."
+    )
+    response = openai_client.responses.create(
+        model=openai_model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ],
+        temperature=0.1,
+    )
+    return {"answer": (response.output_text or "").strip(), "docs": []}
+
+
+def _build_pdf_context_text(*, pdf_path: Path, max_chars: int) -> str:
+    chunks = basic_rag._load_pdf_sections(pdf_path)
+    if not chunks:
+        return ""
+    parts: List[str] = []
+    for c in chunks:
+        parts.append(f"[page={c.page} type={c.source_type} chunk_id={c.chunk_id}]")
+        parts.append(c.text)
+        parts.append("")
+    context = "\n".join(parts).strip()
+    if max_chars and len(context) > max_chars:
+        context = context[:max_chars].rstrip() + "\n\n...(truncated)"
+    return context
+
+
+def _ask_llm_with_pdf_text(
+    *,
+    question: str,
+    openai_model: str,
+    pdf_path: Path,
+    max_context_chars: int,
+) -> Dict[str, Any]:
+    _, openai_client = _clients_cached()
+    context = _build_pdf_context_text(pdf_path=pdf_path, max_chars=max_context_chars)
+    if not context:
+        return {"answer": "PDF에서 텍스트를 추출하지 못했습니다. (스캔 이미지 PDF일 수 있어요)", "docs": []}
+
+    system_prompt = (
+        "당신은 문서 QA 어시스턴트입니다. 반드시 제공된 컨텍스트 범위 안에서만 답하세요. "
+        "근거가 부족하면 모른다고 말하고, 추측하지 마세요."
+    )
+    user_prompt = f"질문:\n{question}\n\n컨텍스트(문서 발췌):\n{context}\n\n요청: 한국어로 간결하고 정확하게 답하세요."
+    response = openai_client.responses.create(
+        model=openai_model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+    )
+    return {"answer": (response.output_text or "").strip(), "docs": []}
+
+
 def main() -> None:
     _load_env()
 
@@ -116,10 +176,11 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader("RAG 설정")
+        use_rag = st.toggle("RAG 사용 (검색+rerank)", value=True)
         collection = st.text_input("Qdrant collection", value=os.environ.get("QDRANT_COLLECTION", basic_rag.DEFAULT_COLLECTION))
         openai_model = st.text_input("OpenAI model", value=os.environ.get("OPENAI_MODEL", basic_rag.DEFAULT_OPENAI_MODEL))
-        qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=20, step=1)
-        rerank_top_k = st.slider("Rerank top_k", min_value=1, max_value=20, value=5, step=1)
+        qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=20, step=1, disabled=not use_rag)
+        rerank_top_k = st.slider("Rerank top_k", min_value=1, max_value=20, value=5, step=1, disabled=not use_rag)
 
         st.subheader("PDF")
         pdf_folder = Path(os.environ.get("PDF_FOLDER", ".")).resolve()
@@ -143,9 +204,25 @@ def main() -> None:
             pdf_path.write_bytes(uploaded.getbuffer())
             st.success(f"업로드 완료: {pdf_path.name}")
 
-        ingest_clicked = st.button("인덱싱(업서트) 실행", type="primary", use_container_width=True)
+        st.subheader("비RAG(문서 직접 주입) 설정")
+        inject_pdf_text = st.toggle("RAG 꺼도 PDF 텍스트를 LLM에 넣기", value=False, disabled=use_rag)
+        max_context_chars = st.slider(
+            "PDF 컨텍스트 최대 글자 수",
+            min_value=2_000,
+            max_value=120_000,
+            value=20_000,
+            step=1_000,
+            disabled=use_rag or (not inject_pdf_text),
+        )
 
-    if ingest_clicked:
+        ingest_clicked = st.button(
+            "인덱싱(업서트) 실행",
+            type="primary",
+            use_container_width=True,
+            disabled=not use_rag,
+        )
+
+    if ingest_clicked and use_rag:
         try:
             if not pdf_path.exists():
                 st.error(f"PDF를 찾을 수 없습니다: {pdf_path}")
@@ -172,14 +249,30 @@ def main() -> None:
             st.markdown(question)
 
         try:
-            with st.spinner("검색 + rerank + 답변 생성 중..."):
-                result = _ask(
-                    question=question,
-                    collection=collection,
-                    openai_model=openai_model,
-                    qdrant_top_k=qdrant_top_k,
-                    rerank_top_k=rerank_top_k,
-                )
+            if use_rag:
+                with st.spinner("검색 + rerank + 답변 생성 중..."):
+                    result = _ask(
+                        question=question,
+                        collection=collection,
+                        openai_model=openai_model,
+                        qdrant_top_k=qdrant_top_k,
+                        rerank_top_k=rerank_top_k,
+                    )
+            else:
+                if inject_pdf_text:
+                    if not pdf_path.exists():
+                        result = {"answer": f"PDF를 찾을 수 없습니다: {pdf_path}", "docs": []}
+                    else:
+                        with st.spinner("LLM 답변 생성 중 (비RAG: PDF 텍스트 직접 주입)..."):
+                            result = _ask_llm_with_pdf_text(
+                                question=question,
+                                openai_model=openai_model,
+                                pdf_path=pdf_path,
+                                max_context_chars=max_context_chars,
+                            )
+                else:
+                    with st.spinner("LLM 답변 생성 중 (RAG 미사용: 문서 없음)..."):
+                        result = _ask_llm_only(question=question, openai_model=openai_model)
             answer = result["answer"] or "검색 결과가 없거나 답변 생성에 실패했습니다."
             docs = result["docs"] or []
 
