@@ -1,6 +1,7 @@
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -62,15 +63,19 @@ def _list_local_pdfs(folder: Path) -> List[Path]:
     return sorted([p for p in folder.glob("*.pdf") if p.is_file()])
 
 
-def _ingest(
+def _ingest_pdfs(
     *,
-    pdf_path: Path,
+    pdf_paths: Sequence[Path],
     collection: str,
+    extract_table_chunks: bool,
 ) -> int:
     embed_model, _ = _load_models_cached()
-    basic_rag.ingest_pdf_to_qdrant(pdf_path=pdf_path, collection=collection, embed_model=embed_model)
-    chunks = basic_rag._load_pdf_sections(pdf_path)
-    return len(chunks)
+    return basic_rag.ingest_pdfs_to_qdrant(
+        pdf_paths=list(pdf_paths),
+        collection=collection,
+        embed_model=embed_model,
+        extract_table_chunks=extract_table_chunks,
+    )
 
 
 def _ask(
@@ -123,8 +128,8 @@ def _ask_llm_only(*, question: str, openai_model: str) -> Dict[str, Any]:
     return {"answer": (response.output_text or "").strip(), "docs": []}
 
 
-def _build_pdf_context_text(*, pdf_path: Path, max_chars: int) -> str:
-    chunks = basic_rag._load_pdf_sections(pdf_path)
+def _build_pdf_context_text(*, pdf_path: Path, max_chars: int, extract_table_chunks: bool) -> str:
+    chunks = basic_rag._load_pdf_sections(pdf_path, extract_table_chunks=extract_table_chunks)
     if not chunks:
         return ""
     parts: List[str] = []
@@ -138,15 +143,79 @@ def _build_pdf_context_text(*, pdf_path: Path, max_chars: int) -> str:
     return context
 
 
+def _build_pdf_context_text_many(
+    *, pdf_paths: Sequence[Path], max_chars: int, extract_table_chunks: bool
+) -> str:
+    blocks: List[str] = []
+    for p in pdf_paths:
+        body = _build_pdf_context_text(
+            pdf_path=p, max_chars=0, extract_table_chunks=extract_table_chunks
+        )
+        if body:
+            blocks.append(f"### 문서: {p.name}\n{body}")
+    combined = "\n\n".join(blocks).strip()
+    if not combined:
+        return ""
+    if max_chars and len(combined) > max_chars:
+        combined = combined[:max_chars].rstrip() + "\n\n...(truncated)"
+    return combined
+
+
+def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
+    seen: set = set()
+    out: List[Path] = []
+    for p in paths:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _default_selected_pdf_names(names: List[str]) -> List[str]:
+    if not names:
+        return []
+    raw = os.environ.get("PDF_PATHS", "").strip()
+    picked: List[str] = []
+    if raw:
+        for part in re.split(r"[,;\n]+", raw):
+            stem = Path(part.strip()).name
+            if stem in names:
+                picked.append(stem)
+    default_pdf = os.environ.get("PDF_PATH", basic_rag.DEFAULT_PDF)
+    if not picked and default_pdf in names:
+        picked = [default_pdf]
+    if not picked:
+        picked = [names[0]]
+    return [n for n in picked if n in names]
+
+
 def _ask_llm_with_pdf_text(
     *,
     question: str,
     openai_model: str,
-    pdf_path: Path,
+    pdf_paths: Sequence[Path],
     max_context_chars: int,
+    extract_table_chunks: bool,
 ) -> Dict[str, Any]:
     _, openai_client = _clients_cached()
-    context = _build_pdf_context_text(pdf_path=pdf_path, max_chars=max_context_chars)
+    paths = list(pdf_paths)
+    if len(paths) == 1:
+        context = _build_pdf_context_text(
+            pdf_path=paths[0],
+            max_chars=max_context_chars,
+            extract_table_chunks=extract_table_chunks,
+        )
+    else:
+        context = _build_pdf_context_text_many(
+            pdf_paths=paths,
+            max_chars=max_context_chars,
+            extract_table_chunks=extract_table_chunks,
+        )
     if not context:
         return {"answer": "PDF에서 텍스트를 추출하지 못했습니다. (스캔 이미지 PDF일 수 있어요)", "docs": []}
 
@@ -170,7 +239,7 @@ def main() -> None:
     _load_env()
 
     st.title("📄 Table RAG (PDF → Qdrant → OpenAI)")
-    st.caption("PDF를 인덱싱하고 질문하면, Qdrant 검색 + rerank 후 OpenAI로 답변합니다.")
+    st.caption("PDF를 여러 개 선택해 한 컬렉션에 인덱싱할 수 있습니다. 질문 시 Qdrant 검색 + rerank 후 OpenAI로 답변합니다.")
 
     _ensure_env_from_sidebar()
 
@@ -181,28 +250,55 @@ def main() -> None:
         openai_model = st.text_input("OpenAI model", value=os.environ.get("OPENAI_MODEL", basic_rag.DEFAULT_OPENAI_MODEL))
         qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=20, step=1, disabled=not use_rag)
         rerank_top_k = st.slider("Rerank top_k", min_value=1, max_value=20, value=5, step=1, disabled=not use_rag)
+        extract_table_chunks = st.toggle(
+            "테이블 전용 청크 추출",
+            value=True,
+            help="끄면 구조화된 표 청크(source_type=table)는 만들지 않고, 페이지 전체 텍스트 청크만 사용합니다. 변경 후 인덱싱을 다시 실행하세요.",
+        )
 
         st.subheader("PDF")
         pdf_folder = Path(os.environ.get("PDF_FOLDER", ".")).resolve()
         pdfs = _list_local_pdfs(pdf_folder)
         default_pdf = os.environ.get("PDF_PATH", basic_rag.DEFAULT_PDF)
 
+        folder_paths: List[Path] = []
         if pdfs:
             names = [p.name for p in pdfs]
-            initial = names.index(default_pdf) if default_pdf in names else 0
-            pdf_name = st.selectbox("로컬 PDF 선택", options=names, index=initial)
-            pdf_path = pdf_folder / pdf_name
+            default_names = _default_selected_pdf_names(names)
+            selected_names = st.multiselect(
+                "로컬 PDF 선택 (복수 가능)",
+                options=names,
+                default=default_names,
+                help="같은 collection에 선택한 모든 PDF를 함께 인덱싱합니다.",
+            )
+            folder_paths = [pdf_folder / n for n in selected_names]
         else:
-            pdf_path = Path(default_pdf)
             st.info("현재 폴더에서 PDF를 찾지 못했어요. 아래 업로더를 사용하거나, PDF를 프로젝트 폴더에 두세요.")
+            if not Path(default_pdf).exists():
+                st.caption(f"단일 경로 힌트: `PDF_PATH={default_pdf}` (파일이 없으면 업로드만 사용)")
 
-        uploaded = st.file_uploader("또는 PDF 업로드", type=["pdf"])
-        if uploaded is not None:
-            upload_dir = Path(".streamlit_uploads")
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            pdf_path = upload_dir / uploaded.name
-            pdf_path.write_bytes(uploaded.getbuffer())
-            st.success(f"업로드 완료: {pdf_path.name}")
+        upload_dir = Path(".streamlit_uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        uploaded_list = st.file_uploader(
+            "또는 PDF 업로드 (복수 가능)",
+            type=["pdf"],
+            accept_multiple_files=True,
+        )
+        upload_paths: List[Path] = []
+        if uploaded_list:
+            for up in uploaded_list:
+                dest = upload_dir / up.name
+                dest.write_bytes(up.getbuffer())
+                upload_paths.append(dest)
+            st.success(f"업로드 완료: {len(upload_paths)}개 파일")
+
+        fallback: List[Path] = []
+        if not folder_paths and not upload_paths:
+            p = Path(default_pdf)
+            if p.exists():
+                fallback = [p]
+
+        pdf_paths = _dedupe_paths(list(folder_paths) + upload_paths + fallback)
 
         st.subheader("비RAG(문서 직접 주입) 설정")
         inject_pdf_text = st.toggle("RAG 꺼도 PDF 텍스트를 LLM에 넣기", value=False, disabled=use_rag)
@@ -224,12 +320,25 @@ def main() -> None:
 
     if ingest_clicked and use_rag:
         try:
-            if not pdf_path.exists():
-                st.error(f"PDF를 찾을 수 없습니다: {pdf_path}")
+            if not pdf_paths:
+                st.error("인덱싱할 PDF가 없습니다. 폴더에서 선택하거나 파일을 업로드하세요.")
             else:
-                with st.spinner("PDF를 읽고 임베딩한 뒤 Qdrant에 업서트 중..."):
-                    n_chunks = _ingest(pdf_path=pdf_path, collection=collection)
-                st.success(f"인덱싱 완료. 추출 청크 수: {n_chunks:,}  |  collection: {collection}")
+                missing = [str(p) for p in pdf_paths if not p.exists()]
+                if missing:
+                    st.error("PDF를 찾을 수 없습니다:\n" + "\n".join(missing))
+                else:
+                    with st.spinner(
+                        f"{len(pdf_paths)}개 PDF를 읽고 임베딩한 뒤 Qdrant에 업서트 중..."
+                    ):
+                        n_chunks = _ingest_pdfs(
+                            pdf_paths=pdf_paths,
+                            collection=collection,
+                            extract_table_chunks=extract_table_chunks,
+                        )
+                    doc_list = ", ".join(p.name for p in pdf_paths)
+                    st.success(
+                        f"인덱싱 완료. PDF {len(pdf_paths)}개 · 청크 {n_chunks:,}개 · collection: `{collection}`\n\n{doc_list}"
+                    )
         except Exception as e:
             st.exception(e)
 
@@ -260,15 +369,20 @@ def main() -> None:
                     )
             else:
                 if inject_pdf_text:
-                    if not pdf_path.exists():
-                        result = {"answer": f"PDF를 찾을 수 없습니다: {pdf_path}", "docs": []}
+                    usable = [p for p in pdf_paths if p.exists()]
+                    if not usable:
+                        result = {
+                            "answer": "PDF를 찾을 수 없습니다. 사이드바에서 파일을 선택하거나 업로드하세요.",
+                            "docs": [],
+                        }
                     else:
                         with st.spinner("LLM 답변 생성 중 (비RAG: PDF 텍스트 직접 주입)..."):
                             result = _ask_llm_with_pdf_text(
                                 question=question,
                                 openai_model=openai_model,
-                                pdf_path=pdf_path,
+                                pdf_paths=usable,
                                 max_context_chars=max_context_chars,
+                                extract_table_chunks=extract_table_chunks,
                             )
                 else:
                     with st.spinner("LLM 답변 생성 중 (RAG 미사용: 문서 없음)..."):
@@ -282,8 +396,10 @@ def main() -> None:
                 if docs:
                     with st.expander(f"근거 청크 보기 (top {len(docs)})", expanded=False):
                         for i, d in enumerate(docs, start=1):
+                            doc_label = d.get("doc") or ""
+                            doc_bit = f"  doc=`{doc_label}`" if doc_label else ""
                             st.markdown(
-                                f"**[{i}]** page={d.get('page')}  chunk_id={d.get('chunk_id')}  "
+                                f"**[{i}]**{doc_bit}  page={d.get('page')}  chunk_id={d.get('chunk_id')}  "
                                 f"type={d.get('source_type')}  rerank={d.get('rerank_score', 0.0):.4f}"
                             )
                             st.code(d.get("text", ""), language="text")

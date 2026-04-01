@@ -1,8 +1,10 @@
 import os
+import re
 import sys
 from dataclasses import dataclass
+from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, List
+from typing import Dict, Iterable, List, Sequence, Union
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -109,7 +111,7 @@ def _find_table_title(page, table) -> str:
         return ""
 
 
-def _load_pdf_sections(pdf_path: Path) -> List[Chunk]:
+def _load_pdf_sections(pdf_path: Path, *, extract_table_chunks: bool = True) -> List[Chunk]:
     # Prefer PyMuPDF for robust layout/table extraction.
     try:
         import fitz  # PyMuPDF
@@ -134,22 +136,61 @@ def _load_pdf_sections(pdf_path: Path) -> List[Chunk]:
                             )
                         )
 
-            table_texts = _extract_page_table_texts(page)
-            for k, table_text in enumerate(table_texts, start=1):
-                chunks.append(
-                    Chunk(
-                        chunk_id=f"p{page_no:04d}_tb{k:03d}",
-                        page=page_no,
-                        text=table_text,
-                        source_type="table",
+            if extract_table_chunks:
+                table_texts = _extract_page_table_texts(page)
+                for k, table_text in enumerate(table_texts, start=1):
+                    chunks.append(
+                        Chunk(
+                            chunk_id=f"p{page_no:04d}_tb{k:03d}",
+                            page=page_no,
+                            text=table_text,
+                            source_type="table",
+                        )
                     )
-                )
         return chunks
     except Exception as exc:
         raise RuntimeError(
             "Failed to extract PDF sections with PyMuPDF. "
             "Install/verify pymupdf and check whether the PDF is readable."
         ) from exc
+
+
+def _sanitize_doc_stem(stem: str) -> str:
+    s = " ".join((stem or "").split())
+    s = re.sub(r"[^\w\-가-힣.]+", "_", s, flags=re.UNICODE)
+    s = s.strip("_") or "doc"
+    return s[:100]
+
+
+def _assign_doc_slugs(pdf_paths: Sequence[Path]) -> Dict[Path, str]:
+    stem_count: Dict[str, int] = defaultdict(int)
+    out: Dict[Path, str] = {}
+    for p in pdf_paths:
+        base = _sanitize_doc_stem(p.stem)
+        stem_count[base] += 1
+        n = stem_count[base]
+        out[p] = base if n == 1 else f"{base}_{n}"
+    return out
+
+
+def _chunks_for_pdf(
+    pdf_path: Path,
+    *,
+    doc_slug: str,
+    extract_table_chunks: bool = True,
+) -> List[Chunk]:
+    raw = _load_pdf_sections(pdf_path, extract_table_chunks=extract_table_chunks)
+    prefixed: List[Chunk] = []
+    for c in raw:
+        prefixed.append(
+            Chunk(
+                chunk_id=f"{doc_slug}::{c.chunk_id}",
+                page=c.page,
+                text=c.text,
+                source_type=c.source_type,
+            )
+        )
+    return prefixed
 
 
 def _chunk_text(text: str, *, chunk_size: int = 1000, chunk_overlap: int = 150) -> Iterable[str]:
@@ -203,15 +244,30 @@ def _embed_texts(embed_model, texts: List[str]) -> List[List[float]]:
     return vecs.tolist() if hasattr(vecs, "tolist") else vecs
 
 
-def ingest_pdf_to_qdrant(
+def ingest_pdfs_to_qdrant(
     *,
-    pdf_path: Path,
+    pdf_paths: Sequence[Union[Path, str]],
     collection: str = DEFAULT_COLLECTION,
     embed_model=None,
-) -> None:
-    chunks = _load_pdf_sections(pdf_path)
-    if not chunks:
-        raise RuntimeError("No text extracted from PDF (is it scanned 이미지 PDF?)")
+    extract_table_chunks: bool = True,
+) -> int:
+    paths = [Path(p).expanduser().resolve() for p in pdf_paths]
+    if not paths:
+        raise ValueError("No PDF paths provided")
+
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        raise FileNotFoundError("PDF not found:\n" + "\n".join(missing))
+
+    slugs = _assign_doc_slugs(paths)
+    chunks: List[Chunk] = []
+    chunk_sources: List[Path] = []
+    for p in paths:
+        doc_chunks = _chunks_for_pdf(p, doc_slug=slugs[p], extract_table_chunks=extract_table_chunks)
+        if not doc_chunks:
+            raise RuntimeError(f"No text extracted from PDF: {p.name} (스캔 이미지 PDF일 수 있음)")
+        chunks.extend(doc_chunks)
+        chunk_sources.extend([p] * len(doc_chunks))
 
     if embed_model is None:
         embed_model, _ = _load_models()
@@ -227,9 +283,9 @@ def ingest_pdf_to_qdrant(
     )
 
     points: List[PointStruct] = []
-    for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
+    for idx, (chunk, vector, src) in enumerate(zip(chunks, vectors, chunk_sources)):
         payload = {
-            "doc": pdf_path.name,
+            "doc": src.name,
             "page": chunk.page,
             "chunk_id": chunk.chunk_id,
             "source_type": chunk.source_type,
@@ -238,7 +294,24 @@ def ingest_pdf_to_qdrant(
         points.append(PointStruct(id=idx, vector=vector, payload=payload))
 
     qdrant.upsert(collection_name=collection, points=points)
-    print(f"Upserted {len(points)} chunks into Qdrant collection '{collection}'.")
+    names = ", ".join(p.name for p in paths)
+    print(f"Upserted {len(points)} chunks from {len(paths)} PDF(s) into '{collection}': {names}")
+    return len(points)
+
+
+def ingest_pdf_to_qdrant(
+    *,
+    pdf_path: Path,
+    collection: str = DEFAULT_COLLECTION,
+    embed_model=None,
+    extract_table_chunks: bool = True,
+) -> int:
+    return ingest_pdfs_to_qdrant(
+        pdf_paths=[pdf_path],
+        collection=collection,
+        embed_model=embed_model,
+        extract_table_chunks=extract_table_chunks,
+    )
 
 
 def search_and_rerank(
@@ -273,6 +346,7 @@ def search_and_rerank(
         docs.append(
             {
                 "score": float(h.score),
+                "doc": payload.get("doc", ""),
                 "page": payload.get("page"),
                 "chunk_id": payload.get("chunk_id"),
                 "source_type": payload.get("source_type", "text"),
@@ -292,8 +366,10 @@ def search_and_rerank(
 def _build_context_from_docs(docs: List[dict]) -> str:
     lines: List[str] = []
     for i, doc in enumerate(docs, start=1):
+        doc_name = doc.get("doc") or ""
+        doc_bit = f" doc={doc_name}" if doc_name else ""
         lines.append(
-            f"[{i}] page={doc.get('page')} chunk_id={doc.get('chunk_id')} "
+            f"[{i}]{doc_bit} page={doc.get('page')} chunk_id={doc.get('chunk_id')} "
             f"type={doc.get('source_type')} rerank={doc.get('rerank_score', 0.0):.4f}"
         )
         lines.append(doc.get("text", ""))
@@ -344,15 +420,27 @@ def main():
 
     load_dotenv()
 
-    pdf_path = Path(os.environ.get("PDF_PATH", DEFAULT_PDF))
     collection = os.environ.get("QDRANT_COLLECTION", DEFAULT_COLLECTION)
     openai_model = os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
     ingest_on_start = os.environ.get("INGEST_ON_START", "1").strip().lower() not in {"0", "false", "no"}
+    extract_table_chunks = os.environ.get("EXTRACT_TABLE_CHUNKS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
 
-    if not pdf_path.exists():
+    pdf_paths_env = os.environ.get("PDF_PATHS", "").strip()
+    if pdf_paths_env:
+        parts = re.split(r"[,;\n]+", pdf_paths_env)
+        pdf_paths = [Path(p.strip()) for p in parts if p.strip()]
+    else:
+        pdf_paths = [Path(os.environ.get("PDF_PATH", DEFAULT_PDF))]
+
+    missing = [str(p) for p in pdf_paths if not p.exists()]
+    if missing:
         raise FileNotFoundError(
-            f"PDF not found: {pdf_path}\n"
-            f"Place the PDF in this folder or set PDF_PATH in .env"
+            "PDF not found:\n" + "\n".join(missing) + "\n"
+            "Place files in this folder or set PDF_PATH (단일) / PDF_PATHS (여러 개, 쉼표·세미콜론·줄바꿈 구분) in .env"
         )
 
     # Load models once and reuse for interactive Q&A.
@@ -361,11 +449,12 @@ def main():
     openai_client = _get_openai_client()
 
     if ingest_on_start:
-        print("Ingesting PDF into Qdrant (bge-m3)...")
-        ingest_pdf_to_qdrant(
-            pdf_path=pdf_path,
+        print(f"Ingesting {len(pdf_paths)} PDF(s) into Qdrant (bge-m3)...")
+        ingest_pdfs_to_qdrant(
+            pdf_paths=pdf_paths,
             collection=collection,
             embed_model=embed_model,
+            extract_table_chunks=extract_table_chunks,
         )
     else:
         print("Skipping ingest (INGEST_ON_START=0). Using existing Qdrant collection.")
