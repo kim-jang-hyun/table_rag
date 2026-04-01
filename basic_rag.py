@@ -35,7 +35,13 @@ def _normalize_cell(value) -> str:
     return " ".join(str(value).split())
 
 
-def _table_to_text(table_rows: List[List[str]], table_title: str = "") -> str:
+def _table_to_text(
+    table_rows: List[List[str]],
+    table_title: str = "",
+    *,
+    start_page: int = 0,
+    end_page: int = 0,
+) -> str:
     if not table_rows:
         return ""
 
@@ -45,6 +51,8 @@ def _table_to_text(table_rows: List[List[str]], table_title: str = "") -> str:
     lines.append("TABLE")
     if table_title:
         lines.append(f"title: {table_title}")
+    if start_page and end_page and end_page != start_page:
+        lines.append(f"pages: {start_page}-{end_page}")
     lines.append(f"columns: {', '.join(header)}")
 
     for row_idx, row in enumerate(body, start=1):
@@ -59,26 +67,132 @@ def _table_to_text(table_rows: List[List[str]], table_title: str = "") -> str:
     return "\n".join(lines).strip()
 
 
-def _extract_page_table_texts(page) -> List[str]:
-    table_texts: List[str] = []
-    try:
-        finder = page.find_tables()
-        tables = getattr(finder, "tables", [])
-        for table in tables:
-            raw_rows = table.extract() or []
-            rows: List[List[str]] = []
-            for raw_row in raw_rows:
-                rows.append([_normalize_cell(cell) for cell in raw_row])
-            if not rows:
-                continue
-            table_title = _find_table_title(page, table)
-            table_text = _table_to_text(rows, table_title=table_title)
-            if table_text:
-                table_texts.append(table_text)
-    except Exception:
-        # If table extraction fails for a page, continue with non-table chunks.
-        pass
-    return table_texts
+def _row_cells_equal(a: List[str], b: List[str]) -> bool:
+    if len(a) != len(b):
+        return False
+    return all(_normalize_cell(x) == _normalize_cell(y) for x, y in zip(a, b))
+
+
+def _table_same_column_count(rows_a: List[List[str]], rows_b: List[List[str]]) -> bool:
+    if not rows_a or not rows_b:
+        return False
+    return len(rows_a[0]) == len(rows_b[0])
+
+
+def _continuation_body_rows(header_row: List[str], next_page_rows: List[List[str]]) -> List[List[str]]:
+    if not next_page_rows:
+        return []
+    if _row_cells_equal(header_row, next_page_rows[0]):
+        return next_page_rows[1:]
+    return next_page_rows
+
+
+def _is_last_table_on_sorted_page(tables: List[dict], idx: int) -> bool:
+    if idx >= len(tables) - 1:
+        return True
+    return tables[idx + 1]["page"] != tables[idx]["page"]
+
+
+def _is_first_table_on_sorted_page(tables: List[dict], idx: int) -> bool:
+    if idx == 0:
+        return True
+    return tables[idx]["page"] != tables[idx - 1]["page"]
+
+
+def _merge_geometry_suggests_split(prev: dict, nxt: dict) -> bool:
+    """이전 조각이 페이지 하단에, 다음 조각이 다음 페이지 상단에 있으면 같은 표의 연장으로 본다."""
+    ph_p = float(prev.get("tail_page_height") or prev.get("page_height") or 0)
+    ph_n = float(nxt.get("page_height") or 0)
+    if ph_p <= 0 or ph_n <= 0:
+        return True
+    _, _, _, py1 = prev["tail_bbox"]
+    _, ny0, _, _ = nxt["bbox"]
+    return (py1 / ph_p >= 0.30) and (ny0 / ph_n <= 0.72)
+
+
+def _merge_cross_page_raw_tables(raw: List[dict]) -> List[dict]:
+    if not raw:
+        return []
+    tables = sorted(raw, key=lambda t: (t["page"], t["bbox"][1]))
+    merged: List[dict] = []
+    i = 0
+    while i < len(tables):
+        cur = {
+            "page": tables[i]["page"],
+            "end_page": tables[i]["page"],
+            "rows": list(tables[i]["rows"]),
+            "title": tables[i]["title"],
+            "bbox": tables[i]["bbox"],
+            "page_height": tables[i]["page_height"],
+            "tail_bbox": tables[i]["bbox"],
+            "tail_page_height": tables[i]["page_height"],
+        }
+        i += 1
+        while i < len(tables):
+            prev_idx = i - 1
+            nxt = tables[i]
+            if nxt["page"] != cur["end_page"] + 1:
+                break
+            if not _is_last_table_on_sorted_page(tables, prev_idx):
+                break
+            if not _is_first_table_on_sorted_page(tables, i):
+                break
+            if not _table_same_column_count(cur["rows"], nxt["rows"]):
+                break
+            if not _merge_geometry_suggests_split(cur, nxt):
+                break
+            hdr = cur["rows"][0]
+            extra = _continuation_body_rows(hdr, nxt["rows"])
+            cur["rows"].extend(extra)
+            cur["end_page"] = nxt["page"]
+            cur["bbox"] = (cur["bbox"][0], cur["bbox"][1], nxt["bbox"][2], nxt["bbox"][3])
+            cur["tail_bbox"] = nxt["bbox"]
+            cur["tail_page_height"] = nxt["page_height"]
+            i += 1
+        merged.append(cur)
+    return merged
+
+
+def _extract_raw_tables_from_doc(doc) -> List[dict]:
+    raw: List[dict] = []
+    for page_index in range(doc.page_count):
+        page = doc.load_page(page_index)
+        page_no = page_index + 1
+        page_h = float(page.rect.height)
+        try:
+            finder = page.find_tables()
+            for table in getattr(finder, "tables", []):
+                raw_rows = table.extract() or []
+                rows = [[_normalize_cell(c) for c in r] for r in raw_rows]
+                if not rows:
+                    continue
+                bbox = tuple(float(x) for x in table.bbox)
+                title = _find_table_title(page, table)
+                raw.append(
+                    {
+                        "page": page_no,
+                        "rows": rows,
+                        "title": title,
+                        "bbox": bbox,
+                        "page_height": page_h,
+                    }
+                )
+        except Exception:
+            pass
+    return raw
+
+
+def _build_merged_table_dicts(doc, *, merge_cross_page_tables: bool) -> List[dict]:
+    raw = _extract_raw_tables_from_doc(doc)
+    if not raw:
+        return []
+    if merge_cross_page_tables:
+        return _merge_cross_page_raw_tables(raw)
+    ordered = sorted(raw, key=lambda t: (t["page"], t["bbox"][1]))
+    return [
+        {"page": t["page"], "end_page": t["page"], "rows": list(t["rows"]), "title": t["title"]}
+        for t in ordered
+    ]
 
 
 def _find_table_title(page, table) -> str:
@@ -115,13 +229,24 @@ def _find_table_title(page, table) -> str:
         return ""
 
 
-def _load_pdf_sections(pdf_path: Path, *, extract_table_chunks: bool = True) -> List[Chunk]:
+def _load_pdf_sections(
+    pdf_path: Path,
+    *,
+    extract_table_chunks: bool = True,
+    merge_cross_page_tables: bool = True,
+) -> List[Chunk]:
     # Prefer PyMuPDF for robust layout/table extraction.
     try:
         import fitz  # PyMuPDF
 
         doc = fitz.open(str(pdf_path))
         chunks: List[Chunk] = []
+        merged_tables: List[dict] = []
+        if extract_table_chunks:
+            merged_tables = _build_merged_table_dicts(
+                doc, merge_cross_page_tables=merge_cross_page_tables
+            )
+
         for page_index in range(doc.page_count):
             page_no = page_index + 1
             page = doc.load_page(page_index)
@@ -140,17 +265,26 @@ def _load_pdf_sections(pdf_path: Path, *, extract_table_chunks: bool = True) -> 
                             )
                         )
 
-            if extract_table_chunks:
-                table_texts = _extract_page_table_texts(page)
-                for k, table_text in enumerate(table_texts, start=1):
+        if extract_table_chunks:
+            for k, mt in enumerate(merged_tables, start=1):
+                start_p = mt["page"]
+                text = _table_to_text(
+                    mt["rows"],
+                    table_title=mt["title"],
+                    start_page=start_p,
+                    end_page=mt["end_page"],
+                )
+                if text:
                     chunks.append(
                         Chunk(
-                            chunk_id=f"p{page_no:04d}_tb{k:03d}",
-                            page=page_no,
-                            text=table_text,
+                            chunk_id=f"p{start_p:04d}_tb{k:03d}",
+                            page=start_p,
+                            text=text,
                             source_type="table",
                         )
                     )
+
+        doc.close()
         return chunks
     except Exception as exc:
         raise RuntimeError(
@@ -182,8 +316,13 @@ def _chunks_for_pdf(
     *,
     doc_slug: str,
     extract_table_chunks: bool = True,
+    merge_cross_page_tables: bool = True,
 ) -> List[Chunk]:
-    raw = _load_pdf_sections(pdf_path, extract_table_chunks=extract_table_chunks)
+    raw = _load_pdf_sections(
+        pdf_path,
+        extract_table_chunks=extract_table_chunks,
+        merge_cross_page_tables=merge_cross_page_tables,
+    )
     prefixed: List[Chunk] = []
     for c in raw:
         prefixed.append(
@@ -321,6 +460,7 @@ def ingest_pdfs_to_qdrant(
     embed_model=None,
     extract_table_chunks: bool = True,
     enable_hybrid: bool = True,
+    merge_cross_page_tables: bool = True,
     sparse_embedder=None,
 ) -> int:
     paths = [Path(p).expanduser().resolve() for p in pdf_paths]
@@ -335,7 +475,12 @@ def ingest_pdfs_to_qdrant(
     chunks: List[Chunk] = []
     chunk_sources: List[Path] = []
     for p in paths:
-        doc_chunks = _chunks_for_pdf(p, doc_slug=slugs[p], extract_table_chunks=extract_table_chunks)
+        doc_chunks = _chunks_for_pdf(
+            p,
+            doc_slug=slugs[p],
+            extract_table_chunks=extract_table_chunks,
+            merge_cross_page_tables=merge_cross_page_tables,
+        )
         if not doc_chunks:
             raise RuntimeError(f"No text extracted from PDF: {p.name} (스캔 이미지 PDF일 수 있음)")
         chunks.extend(doc_chunks)
@@ -407,6 +552,7 @@ def ingest_pdf_to_qdrant(
     embed_model=None,
     extract_table_chunks: bool = True,
     enable_hybrid: bool = True,
+    merge_cross_page_tables: bool = True,
 ) -> int:
     return ingest_pdfs_to_qdrant(
         pdf_paths=[pdf_path],
@@ -414,6 +560,7 @@ def ingest_pdf_to_qdrant(
         embed_model=embed_model,
         extract_table_chunks=extract_table_chunks,
         enable_hybrid=enable_hybrid,
+        merge_cross_page_tables=merge_cross_page_tables,
     )
 
 
@@ -594,6 +741,11 @@ def main():
         "false",
         "no",
     }
+    merge_cross_page_tables = os.environ.get("MERGE_CROSS_PAGE_TABLES", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
 
     pdf_paths_env = os.environ.get("PDF_PATHS", "").strip()
     if pdf_paths_env:
@@ -634,6 +786,7 @@ def main():
             embed_model=embed_model,
             extract_table_chunks=extract_table_chunks,
             enable_hybrid=want_hybrid,
+            merge_cross_page_tables=merge_cross_page_tables,
         )
     else:
         print("Skipping ingest (INGEST_ON_START=0). Using existing Qdrant collection.")

@@ -81,6 +81,7 @@ def _ingest_pdfs(
     collection: str,
     extract_table_chunks: bool,
     enable_hybrid: bool,
+    merge_cross_page_tables: bool,
 ) -> int:
     embed_model = _embed_model_cached()
     sparse = _sparse_embedder_cached() if enable_hybrid else None
@@ -90,6 +91,7 @@ def _ingest_pdfs(
         embed_model=embed_model,
         extract_table_chunks=extract_table_chunks,
         enable_hybrid=enable_hybrid,
+        merge_cross_page_tables=merge_cross_page_tables,
         sparse_embedder=sparse,
     )
 
@@ -152,8 +154,18 @@ def _ask_llm_only(*, question: str, openai_model: str) -> Dict[str, Any]:
     return {"answer": (response.output_text or "").strip(), "docs": []}
 
 
-def _build_pdf_context_text(*, pdf_path: Path, max_chars: int, extract_table_chunks: bool) -> str:
-    chunks = basic_rag._load_pdf_sections(pdf_path, extract_table_chunks=extract_table_chunks)
+def _build_pdf_context_text(
+    *,
+    pdf_path: Path,
+    max_chars: int,
+    extract_table_chunks: bool,
+    merge_cross_page_tables: bool,
+) -> str:
+    chunks = basic_rag._load_pdf_sections(
+        pdf_path,
+        extract_table_chunks=extract_table_chunks,
+        merge_cross_page_tables=merge_cross_page_tables,
+    )
     if not chunks:
         return ""
     parts: List[str] = []
@@ -168,12 +180,19 @@ def _build_pdf_context_text(*, pdf_path: Path, max_chars: int, extract_table_chu
 
 
 def _build_pdf_context_text_many(
-    *, pdf_paths: Sequence[Path], max_chars: int, extract_table_chunks: bool
+    *,
+    pdf_paths: Sequence[Path],
+    max_chars: int,
+    extract_table_chunks: bool,
+    merge_cross_page_tables: bool,
 ) -> str:
     blocks: List[str] = []
     for p in pdf_paths:
         body = _build_pdf_context_text(
-            pdf_path=p, max_chars=0, extract_table_chunks=extract_table_chunks
+            pdf_path=p,
+            max_chars=0,
+            extract_table_chunks=extract_table_chunks,
+            merge_cross_page_tables=merge_cross_page_tables,
         )
         if body:
             blocks.append(f"### 문서: {p.name}\n{body}")
@@ -225,6 +244,7 @@ def _ask_llm_with_pdf_text(
     pdf_paths: Sequence[Path],
     max_context_chars: int,
     extract_table_chunks: bool,
+    merge_cross_page_tables: bool,
 ) -> Dict[str, Any]:
     _, openai_client = _clients_cached()
     paths = list(pdf_paths)
@@ -233,12 +253,14 @@ def _ask_llm_with_pdf_text(
             pdf_path=paths[0],
             max_chars=max_context_chars,
             extract_table_chunks=extract_table_chunks,
+            merge_cross_page_tables=merge_cross_page_tables,
         )
     else:
         context = _build_pdf_context_text_many(
             pdf_paths=paths,
             max_chars=max_context_chars,
             extract_table_chunks=extract_table_chunks,
+            merge_cross_page_tables=merge_cross_page_tables,
         )
     if not context:
         return {"answer": "PDF에서 텍스트를 추출하지 못했습니다. (스캔 이미지 PDF일 수 있어요)", "docs": []}
@@ -309,6 +331,17 @@ def main() -> None:
             "테이블 전용 청크 추출",
             value=True,
             help="끄면 구조화된 표 청크(source_type=table)는 만들지 않고, 페이지 전체 텍스트 청크만 사용합니다. 변경 후 인덱싱을 다시 실행하세요.",
+        )
+        _env_mcp = os.environ.get("MERGE_CROSS_PAGE_TABLES", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        merge_cross_page_tables = st.toggle(
+            "페이지 간 표 병합",
+            value=_env_mcp,
+            disabled=not use_rag or (not extract_table_chunks),
+            help="켜면 여러 페이지에 걸친 표를 가능한 한 하나의 table 청크로 합칩니다. 끄면 페이지마다 잡힌 표 조각만 사용합니다. 변경 후 인덱싱을 다시 실행하세요.",
         )
 
         st.subheader("PDF")
@@ -393,6 +426,9 @@ def main() -> None:
                             collection=collection,
                             extract_table_chunks=extract_table_chunks,
                             enable_hybrid=use_hybrid,
+                            merge_cross_page_tables=(
+                                merge_cross_page_tables and extract_table_chunks
+                            ),
                         )
                     doc_list = ", ".join(p.name for p in pdf_paths)
                     mode = "하이브리드 (dense+BM25)" if use_hybrid else "밀집 벡터만"
@@ -453,6 +489,9 @@ def main() -> None:
                                 pdf_paths=usable,
                                 max_context_chars=max_context_chars,
                                 extract_table_chunks=extract_table_chunks,
+                                merge_cross_page_tables=(
+                                    merge_cross_page_tables and extract_table_chunks
+                                ),
                             )
                 else:
                     with st.spinner("LLM 답변 생성 중 (RAG 미사용: 문서 없음)..."):
