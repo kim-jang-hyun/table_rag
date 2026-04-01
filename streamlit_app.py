@@ -56,6 +56,13 @@ def _reranker_cached():
 
 
 @st.cache_resource
+def _sparse_embedder_cached():
+    if not basic_rag.is_fastembed_available():
+        return None
+    return basic_rag._load_sparse_embedder()
+
+
+@st.cache_resource
 def _clients_cached() -> Tuple[Any, Any]:
     qdrant = basic_rag._get_qdrant_client()
     openai_client = basic_rag._get_openai_client()
@@ -73,13 +80,17 @@ def _ingest_pdfs(
     pdf_paths: Sequence[Path],
     collection: str,
     extract_table_chunks: bool,
+    enable_hybrid: bool,
 ) -> int:
     embed_model = _embed_model_cached()
+    sparse = _sparse_embedder_cached() if enable_hybrid else None
     return basic_rag.ingest_pdfs_to_qdrant(
         pdf_paths=list(pdf_paths),
         collection=collection,
         embed_model=embed_model,
         extract_table_chunks=extract_table_chunks,
+        enable_hybrid=enable_hybrid,
+        sparse_embedder=sparse,
     )
 
 
@@ -91,19 +102,23 @@ def _ask(
     qdrant_top_k: int,
     rerank_top_k: int,
     use_reranker: bool,
+    use_hybrid: bool,
 ) -> Dict[str, Any]:
     embed_model = _embed_model_cached()
     reranker = _reranker_cached() if use_reranker else None
+    sparse = _sparse_embedder_cached() if use_hybrid else None
     qdrant, openai_client = _clients_cached()
 
-    docs = basic_rag.search_and_rerank(
+    docs, hybrid_warning = basic_rag.search_and_rerank(
         query=question,
         collection=collection,
         qdrant_top_k=qdrant_top_k,
         rerank_top_k=rerank_top_k,
         use_reranker=use_reranker,
+        use_hybrid=use_hybrid,
         embed_model=embed_model,
         reranker=reranker,
+        sparse_embedder=sparse,
         qdrant=qdrant,
     )
 
@@ -117,7 +132,7 @@ def _ask(
             use_reranker=use_reranker,
         )
 
-    return {"answer": answer, "docs": docs}
+    return {"answer": answer, "docs": docs, "hybrid_warning": hybrid_warning}
 
 
 def _ask_llm_only(*, question: str, openai_model: str) -> Dict[str, Any]:
@@ -249,7 +264,7 @@ def main() -> None:
 
     st.title("📄 Table RAG (PDF → Qdrant → OpenAI)")
     st.caption(
-        "PDF를 여러 개 선택해 한 컬렉션에 인덱싱할 수 있습니다. 질문 시 Qdrant 검색 후, 옵션에 따라 리랭커를 거쳐 OpenAI로 답변합니다."
+        "PDF를 여러 개 인덱싱할 수 있습니다. 옵션으로 하이브리드(의미 벡터 + BM25 키워드, RRF), 리랭커, OpenAI 답변을 사용합니다."
     )
 
     _ensure_env_from_sidebar()
@@ -257,6 +272,13 @@ def main() -> None:
     with st.sidebar:
         st.subheader("RAG 설정")
         use_rag = st.toggle("RAG 사용 (검색+선택적 rerank)", value=True)
+        hybrid_ok = basic_rag.is_fastembed_available()
+        if use_rag and not hybrid_ok:
+            st.caption(
+                "참고: fastembed가 없어 BM25 하이브리드는 동작하지 않습니다. "
+                "같은 venv에서 `pip install fastembed` 후 앱을 다시 실행하세요. "
+                "설치가 안 되면 **Python 3.11** 가상환경을 만드는 것을 권장합니다."
+            )
         collection = st.text_input("Qdrant collection", value=os.environ.get("QDRANT_COLLECTION", basic_rag.DEFAULT_COLLECTION))
         openai_model = st.text_input("OpenAI model", value=os.environ.get("OPENAI_MODEL", basic_rag.DEFAULT_OPENAI_MODEL))
         qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=20, step=1, disabled=not use_rag)
@@ -275,6 +297,13 @@ def main() -> None:
             step=1,
             disabled=not use_rag,
             help="리랭커를 켠 경우: rerank 후 이 개수만 LLM에 전달. 끈 경우: 벡터 검색 상위 이 개수.",
+        )
+        _default_hybrid = os.environ.get("USE_HYBRID", "1").strip().lower() not in {"0", "false", "no"}
+        use_hybrid = st.toggle(
+            "하이브리드 (BM25 + 벡터, 인덱싱·검색)",
+            value=_default_hybrid,
+            disabled=not use_rag,
+            help="켜면 인덱싱 시 dense+BM25 sparse를 함께 저장하고, 검색 시 RRF로 결합합니다. 끄면 밀집 벡터만 사용합니다. 켠 뒤에는 인덱싱을 다시 실행하세요.",
         )
         extract_table_chunks = st.toggle(
             "테이블 전용 청크 추출",
@@ -353,17 +382,22 @@ def main() -> None:
                 if missing:
                     st.error("PDF를 찾을 수 없습니다:\n" + "\n".join(missing))
                 else:
-                    with st.spinner(
-                        f"{len(pdf_paths)}개 PDF를 읽고 임베딩한 뒤 Qdrant에 업서트 중..."
-                    ):
+                    spin = (
+                        f"{len(pdf_paths)}개 PDF → 밀집+BM25 임베딩 후 Qdrant 업서트..."
+                        if use_hybrid
+                        else f"{len(pdf_paths)}개 PDF를 읽고 임베딩한 뒤 Qdrant에 업서트 중..."
+                    )
+                    with st.spinner(spin):
                         n_chunks = _ingest_pdfs(
                             pdf_paths=pdf_paths,
                             collection=collection,
                             extract_table_chunks=extract_table_chunks,
+                            enable_hybrid=use_hybrid,
                         )
                     doc_list = ", ".join(p.name for p in pdf_paths)
+                    mode = "하이브리드 (dense+BM25)" if use_hybrid else "밀집 벡터만"
                     st.success(
-                        f"인덱싱 완료. PDF {len(pdf_paths)}개 · 청크 {n_chunks:,}개 · collection: `{collection}`\n\n{doc_list}"
+                        f"인덱싱 완료 ({mode}). PDF {len(pdf_paths)}개 · 청크 {n_chunks:,}개 · collection: `{collection}`\n\n{doc_list}"
                     )
         except Exception as e:
             st.exception(e)
@@ -385,7 +419,14 @@ def main() -> None:
 
         try:
             if use_rag:
-                spin = "검색 + rerank + 답변 생성 중..." if use_reranker else "검색(벡터) + 답변 생성 중..."
+                if use_hybrid and use_reranker:
+                    spin = "하이브리드(RRF) 검색 + rerank + 답변 생성 중..."
+                elif use_hybrid:
+                    spin = "하이브리드(RRF) 검색 + 답변 생성 중..."
+                elif use_reranker:
+                    spin = "검색 + rerank + 답변 생성 중..."
+                else:
+                    spin = "검색(벡터) + 답변 생성 중..."
                 with st.spinner(spin):
                     result = _ask(
                         question=question,
@@ -394,6 +435,7 @@ def main() -> None:
                         qdrant_top_k=qdrant_top_k,
                         rerank_top_k=rerank_top_k,
                         use_reranker=use_reranker,
+                        use_hybrid=use_hybrid,
                     )
             else:
                 if inject_pdf_text:
@@ -417,9 +459,12 @@ def main() -> None:
                         result = _ask_llm_only(question=question, openai_model=openai_model)
             answer = result["answer"] or "검색 결과가 없거나 답변 생성에 실패했습니다."
             docs = result["docs"] or []
+            hwarn = result.get("hybrid_warning") or ""
 
             st.session_state.chat.append({"role": "assistant", "content": answer})
             with st.chat_message("assistant"):
+                if hwarn:
+                    st.warning(hwarn)
                 st.markdown(answer)
                 if docs:
                     with st.expander(f"근거 청크 보기 (top {len(docs)})", expanded=False):

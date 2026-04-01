@@ -4,17 +4,21 @@ import sys
 from dataclasses import dataclass
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Union
+from typing import Dict, Iterable, List, Sequence, Tuple, Union
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from qdrant_client import QdrantClient
+from qdrant_client.http import models as qm
 from qdrant_client.http.models import Distance, PointStruct, VectorParams
 
 
 DEFAULT_PDF = "[POSCO홀딩스]임원ㆍ주요주주특정증권등소유상황보고서(2026.03.10).pdf"
 DEFAULT_COLLECTION = "posco_holdings_report_2026_03_10"
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+HYBRID_DENSE = "dense"
+HYBRID_SPARSE = "sparse"
+DEFAULT_SPARSE_MODEL = "Qdrant/bm25"
 
 
 @dataclass(frozen=True)
@@ -252,12 +256,72 @@ def _embed_texts(embed_model, texts: List[str]) -> List[List[float]]:
     return vecs.tolist() if hasattr(vecs, "tolist") else vecs
 
 
+def is_fastembed_available() -> bool:
+    try:
+        import fastembed  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _load_sparse_embedder(model_name: str = DEFAULT_SPARSE_MODEL):
+    try:
+        from fastembed import SparseTextEmbedding
+    except ImportError as exc:
+        raise RuntimeError(
+            "하이브리드(BM25)에 fastembed 패키지가 필요합니다. "
+            "`pip install fastembed` 후 다시 시도하세요. "
+            "(Windows에서는 Python 3.10~3.12 환경이 설치에 유리할 수 있습니다.)"
+        ) from exc
+
+    return SparseTextEmbedding(model_name=model_name)
+
+
+def _numpyish_to_list(x) -> List:
+    if x is None:
+        return []
+    if hasattr(x, "tolist"):
+        return x.tolist()
+    return list(x)
+
+
+def _sparse_embedding_to_qdrant(sparse_emb) -> qm.SparseVector:
+    return qm.SparseVector(
+        indices=_numpyish_to_list(getattr(sparse_emb, "indices", [])),
+        values=_numpyish_to_list(getattr(sparse_emb, "values", [])),
+    )
+
+
+def collection_is_hybrid(qdrant: QdrantClient, collection: str) -> bool:
+    info = qdrant.get_collection(collection_name=collection)
+    params = info.config.params
+    sparse = getattr(params, "sparse_vectors", None) or {}
+    if not sparse:
+        return False
+    vecs = params.vectors
+    if isinstance(vecs, dict):
+        return HYBRID_DENSE in vecs
+    return False
+
+
+def _sparse_vector_params() -> qm.SparseVectorParams:
+    modifier = getattr(qm, "Modifier", None)
+    if modifier is not None and hasattr(modifier, "IDF"):
+        try:
+            return qm.SparseVectorParams(modifier=modifier.IDF)
+        except Exception:
+            pass
+    return qm.SparseVectorParams()
+
+
 def ingest_pdfs_to_qdrant(
     *,
     pdf_paths: Sequence[Union[Path, str]],
     collection: str = DEFAULT_COLLECTION,
     embed_model=None,
     extract_table_chunks: bool = True,
+    enable_hybrid: bool = True,
+    sparse_embedder=None,
 ) -> int:
     paths = [Path(p).expanduser().resolve() for p in pdf_paths]
     if not paths:
@@ -278,17 +342,41 @@ def ingest_pdfs_to_qdrant(
         chunk_sources.extend([p] * len(doc_chunks))
 
     if embed_model is None:
-        embed_model, _ = _load_models()
-    vectors = _embed_texts(embed_model, [c.text for c in chunks])
+        embed_model = _load_embed_model()
+    texts = [c.text for c in chunks]
+    vectors = _embed_texts(embed_model, texts)
     vector_size = len(vectors[0])
+
+    do_hybrid = bool(enable_hybrid) and is_fastembed_available()
+    if enable_hybrid and not do_hybrid:
+        print(
+            "주의: 하이브리드 인덱싱을 요청했지만 fastembed를 불러올 수 없어 밀집 벡터만 저장합니다. "
+            "`pip install fastembed` 또는 Python 3.10~3.12 가상환경을 사용하세요."
+        )
+
+    sparse_vectors: List[qm.SparseVector] = []
+    if do_hybrid:
+        if sparse_embedder is None:
+            sparse_embedder = _load_sparse_embedder()
+        sparse_embs = list(sparse_embedder.embed(texts, batch_size=32))
+        if len(sparse_embs) != len(chunks):
+            raise RuntimeError("Sparse embedding count does not match chunk count")
+        sparse_vectors = [_sparse_embedding_to_qdrant(s) for s in sparse_embs]
 
     qdrant = _get_qdrant_client()
     if qdrant.collection_exists(collection_name=collection):
         qdrant.delete_collection(collection_name=collection)
-    qdrant.create_collection(
-        collection_name=collection,
-        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
-    )
+    if do_hybrid:
+        qdrant.create_collection(
+            collection_name=collection,
+            vectors_config={HYBRID_DENSE: VectorParams(size=vector_size, distance=Distance.COSINE)},
+            sparse_vectors_config={HYBRID_SPARSE: _sparse_vector_params()},
+        )
+    else:
+        qdrant.create_collection(
+            collection_name=collection,
+            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+        )
 
     points: List[PointStruct] = []
     for idx, (chunk, vector, src) in enumerate(zip(chunks, vectors, chunk_sources)):
@@ -299,11 +387,16 @@ def ingest_pdfs_to_qdrant(
             "source_type": chunk.source_type,
             "text": chunk.text,
         }
-        points.append(PointStruct(id=idx, vector=vector, payload=payload))
+        if do_hybrid:
+            vec_payload = {HYBRID_DENSE: vector, HYBRID_SPARSE: sparse_vectors[idx]}
+        else:
+            vec_payload = vector
+        points.append(PointStruct(id=idx, vector=vec_payload, payload=payload))
 
     qdrant.upsert(collection_name=collection, points=points)
     names = ", ".join(p.name for p in paths)
-    print(f"Upserted {len(points)} chunks from {len(paths)} PDF(s) into '{collection}': {names}")
+    mode = "hybrid dense+BM25 sparse" if do_hybrid else "dense only"
+    print(f"Upserted {len(points)} chunks ({mode}) from {len(paths)} PDF(s) into '{collection}': {names}")
     return len(points)
 
 
@@ -313,12 +406,14 @@ def ingest_pdf_to_qdrant(
     collection: str = DEFAULT_COLLECTION,
     embed_model=None,
     extract_table_chunks: bool = True,
+    enable_hybrid: bool = True,
 ) -> int:
     return ingest_pdfs_to_qdrant(
         pdf_paths=[pdf_path],
         collection=collection,
         embed_model=embed_model,
         extract_table_chunks=extract_table_chunks,
+        enable_hybrid=enable_hybrid,
     )
 
 
@@ -329,10 +424,12 @@ def search_and_rerank(
     qdrant_top_k: int = 20,
     rerank_top_k: int = 5,
     use_reranker: bool = True,
+    use_hybrid: bool = True,
     embed_model=None,
     reranker=None,
+    sparse_embedder=None,
     qdrant=None,
-):
+) -> Tuple[List[dict], str]:
     if embed_model is None:
         embed_model = _load_embed_model()
     if use_reranker and reranker is None:
@@ -340,16 +437,67 @@ def search_and_rerank(
     if qdrant is None:
         qdrant = _get_qdrant_client()
 
+    hybrid_warning = ""
     qvec = _embed_texts(embed_model, [query])[0]
-    resp = qdrant.query_points(
-        collection_name=collection,
-        query=qvec,
-        limit=qdrant_top_k,
-        with_payload=True,
-    )
+    is_hybrid_col = collection_is_hybrid(qdrant, collection)
+
+    if use_hybrid and is_hybrid_col and is_fastembed_available():
+        if sparse_embedder is None:
+            sparse_embedder = _load_sparse_embedder()
+        sq = list(sparse_embedder.query_embed(query))[0]
+        svec = _sparse_embedding_to_qdrant(sq)
+        resp = qdrant.query_points(
+            collection_name=collection,
+            prefetch=[
+                qm.Prefetch(query=qvec, limit=qdrant_top_k, using=HYBRID_DENSE),
+                qm.Prefetch(query=svec, limit=qdrant_top_k, using=HYBRID_SPARSE),
+            ],
+            query=qm.FusionQuery(fusion=qm.Fusion.RRF),
+            limit=qdrant_top_k,
+            with_payload=True,
+        )
+    elif use_hybrid and is_hybrid_col:
+        hybrid_warning = (
+            "하이브리드 collection이지만 fastembed가 없어 BM25 없이 벡터 검색만 했습니다. "
+            "`pip install fastembed` 하거나 Python 3.10~3.12 가상환경을 쓰면 RRF 하이브리드를 쓸 수 있습니다."
+        )
+        resp = qdrant.query_points(
+            collection_name=collection,
+            query=qvec,
+            using=HYBRID_DENSE,
+            limit=qdrant_top_k,
+            with_payload=True,
+        )
+    elif use_hybrid and not is_hybrid_col:
+        hybrid_warning = (
+            "하이브리드 검색을 켰지만 이 collection은 BM25 sparse 없이 인덱싱되었습니다. "
+            "벡터 검색만 사용했습니다. 하이브리드 인덱싱을 켠 뒤 다시 인덱싱하세요."
+        )
+        resp = qdrant.query_points(
+            collection_name=collection,
+            query=qvec,
+            limit=qdrant_top_k,
+            with_payload=True,
+        )
+    elif is_hybrid_col:
+        resp = qdrant.query_points(
+            collection_name=collection,
+            query=qvec,
+            using=HYBRID_DENSE,
+            limit=qdrant_top_k,
+            with_payload=True,
+        )
+    else:
+        resp = qdrant.query_points(
+            collection_name=collection,
+            query=qvec,
+            limit=qdrant_top_k,
+            with_payload=True,
+        )
+
     hits = resp.points
     if not hits:
-        return []
+        return [], hybrid_warning
 
     docs = []
     for h in hits:
@@ -376,7 +524,7 @@ def search_and_rerank(
             d["rerank_score"] = float(d["score"])
         docs.sort(key=lambda x: x["score"], reverse=True)
 
-    return docs[:rerank_top_k]
+    return docs[:rerank_top_k], hybrid_warning
 
 
 def _build_context_from_docs(docs: List[dict], *, use_reranker: bool = True) -> str:
@@ -462,20 +610,30 @@ def main():
         )
 
     use_reranker = os.environ.get("USE_RERANKER", "1").strip().lower() not in {"0", "false", "no"}
+    want_hybrid = os.environ.get("USE_HYBRID", "1").strip().lower() not in {"0", "false", "no"}
+    use_hybrid = want_hybrid and is_fastembed_available()
+    if want_hybrid and not use_hybrid:
+        print(
+            "(알림) USE_HYBRID는 켜져 있지만 fastembed를 불러올 수 없습니다. "
+            "밀집 벡터만 사용합니다. `pip install fastembed` 또는 Python 3.10~3.12 venv를 권장합니다."
+        )
 
     # Load models once and reuse for interactive Q&A.
     embed_model = _load_embed_model()
     reranker = _load_reranker() if use_reranker else None
+    sparse_embedder = _load_sparse_embedder() if use_hybrid else None
     qdrant = _get_qdrant_client()
     openai_client = _get_openai_client()
 
     if ingest_on_start:
-        print(f"Ingesting {len(pdf_paths)} PDF(s) into Qdrant (bge-m3)...")
+        mode = "bge-m3 + BM25 sparse (hybrid)" if want_hybrid else "bge-m3 (dense only)"
+        print(f"Ingesting {len(pdf_paths)} PDF(s) into Qdrant ({mode})...")
         ingest_pdfs_to_qdrant(
             pdf_paths=pdf_paths,
             collection=collection,
             embed_model=embed_model,
             extract_table_chunks=extract_table_chunks,
+            enable_hybrid=want_hybrid,
         )
     else:
         print("Skipping ingest (INGEST_ON_START=0). Using existing Qdrant collection.")
@@ -488,16 +646,20 @@ def main():
         if user_q.lower() in {"exit", "quit"}:
             break
 
-        top = search_and_rerank(
+        top, hybrid_warn = search_and_rerank(
             query=user_q,
             collection=collection,
             qdrant_top_k=20,
             rerank_top_k=5,
             use_reranker=use_reranker,
+            use_hybrid=want_hybrid,
             embed_model=embed_model,
             reranker=reranker,
+            sparse_embedder=sparse_embedder,
             qdrant=qdrant,
         )
+        if hybrid_warn:
+            print(f"(알림) {hybrid_warn}")
         if not top:
             print("A> 검색 결과가 없습니다.")
             continue
