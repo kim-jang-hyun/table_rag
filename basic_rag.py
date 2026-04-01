@@ -224,14 +224,22 @@ def _get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def _load_embed_model():
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer("BAAI/bge-m3")
+
+
+def _load_reranker():
+    from sentence_transformers import CrossEncoder
+
+    return CrossEncoder("BAAI/bge-reranker-v2-m3")
+
+
 def _load_models():
     # Lazy import to keep startup errors clearer.
     # Using sentence-transformers avoids optional deps that require MSVC build tools on Windows.
-    from sentence_transformers import CrossEncoder, SentenceTransformer
-
-    embed = SentenceTransformer("BAAI/bge-m3")
-    rerank = CrossEncoder("BAAI/bge-reranker-v2-m3")
-    return embed, rerank
+    return _load_embed_model(), _load_reranker()
 
 
 def _embed_texts(embed_model, texts: List[str]) -> List[List[float]]:
@@ -320,12 +328,15 @@ def search_and_rerank(
     collection: str = DEFAULT_COLLECTION,
     qdrant_top_k: int = 20,
     rerank_top_k: int = 5,
+    use_reranker: bool = True,
     embed_model=None,
     reranker=None,
     qdrant=None,
 ):
-    if embed_model is None or reranker is None:
-        embed_model, reranker = _load_models()
+    if embed_model is None:
+        embed_model = _load_embed_model()
+    if use_reranker and reranker is None:
+        reranker = _load_reranker()
     if qdrant is None:
         qdrant = _get_qdrant_client()
 
@@ -354,23 +365,29 @@ def search_and_rerank(
             }
         )
 
-    pairs = [[query, d["text"]] for d in docs]
-    rerank_scores = reranker.predict(pairs)
-    for d, s in zip(docs, rerank_scores):
-        d["rerank_score"] = float(s)
+    if use_reranker and reranker is not None:
+        pairs = [[query, d["text"]] for d in docs]
+        rerank_scores = reranker.predict(pairs)
+        for d, s in zip(docs, rerank_scores):
+            d["rerank_score"] = float(s)
+        docs.sort(key=lambda x: x["rerank_score"], reverse=True)
+    else:
+        for d in docs:
+            d["rerank_score"] = float(d["score"])
+        docs.sort(key=lambda x: x["score"], reverse=True)
 
-    docs.sort(key=lambda x: x["rerank_score"], reverse=True)
     return docs[:rerank_top_k]
 
 
-def _build_context_from_docs(docs: List[dict]) -> str:
+def _build_context_from_docs(docs: List[dict], *, use_reranker: bool = True) -> str:
     lines: List[str] = []
+    rank_key = "rerank" if use_reranker else "vector"
     for i, doc in enumerate(docs, start=1):
         doc_name = doc.get("doc") or ""
         doc_bit = f" doc={doc_name}" if doc_name else ""
         lines.append(
             f"[{i}]{doc_bit} page={doc.get('page')} chunk_id={doc.get('chunk_id')} "
-            f"type={doc.get('source_type')} rerank={doc.get('rerank_score', 0.0):.4f}"
+            f"type={doc.get('source_type')} {rank_key}={doc.get('rerank_score', 0.0):.4f}"
         )
         lines.append(doc.get("text", ""))
         lines.append("")
@@ -383,8 +400,9 @@ def answer_with_openai(
     docs: List[dict],
     openai_client: OpenAI,
     model: str = DEFAULT_OPENAI_MODEL,
+    use_reranker: bool = True,
 ) -> str:
-    context = _build_context_from_docs(docs)
+    context = _build_context_from_docs(docs, use_reranker=use_reranker)
     if not context:
         return "검색된 컨텍스트가 없어 답변을 생성할 수 없습니다."
 
@@ -443,8 +461,11 @@ def main():
             "Place files in this folder or set PDF_PATH (단일) / PDF_PATHS (여러 개, 쉼표·세미콜론·줄바꿈 구분) in .env"
         )
 
+    use_reranker = os.environ.get("USE_RERANKER", "1").strip().lower() not in {"0", "false", "no"}
+
     # Load models once and reuse for interactive Q&A.
-    embed_model, reranker = _load_models()
+    embed_model = _load_embed_model()
+    reranker = _load_reranker() if use_reranker else None
     qdrant = _get_qdrant_client()
     openai_client = _get_openai_client()
 
@@ -472,6 +493,7 @@ def main():
             collection=collection,
             qdrant_top_k=20,
             rerank_top_k=5,
+            use_reranker=use_reranker,
             embed_model=embed_model,
             reranker=reranker,
             qdrant=qdrant,
@@ -480,11 +502,12 @@ def main():
             print("A> 검색 결과가 없습니다.")
             continue
 
-        print("\nA> (rerank 상위 5개 청크)")
+        rank_label = "rerank" if use_reranker else "vector"
+        print(f"\nA> ({rank_label} 기준 상위 {len(top)}개 청크)")
         for i, r in enumerate(top, start=1):
             print(
                 f"\n[{i}] page={r['page']} chunk_id={r['chunk_id']} "
-                f"type={r['source_type']} rerank={r['rerank_score']:.4f}"
+                f"type={r['source_type']} {rank_label}={r['rerank_score']:.4f}"
             )
             print(r["text"])
 
@@ -493,6 +516,7 @@ def main():
             docs=top,
             openai_client=openai_client,
             model=openai_model,
+            use_reranker=use_reranker,
         )
         print("\nA> (OpenAI 답변)")
         print(llm_answer or "답변 생성에 실패했습니다.")

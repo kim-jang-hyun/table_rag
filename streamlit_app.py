@@ -46,8 +46,13 @@ def _ensure_env_from_sidebar() -> None:
 
 
 @st.cache_resource
-def _load_models_cached():
-    return basic_rag._load_models()
+def _embed_model_cached():
+    return basic_rag._load_embed_model()
+
+
+@st.cache_resource
+def _reranker_cached():
+    return basic_rag._load_reranker()
 
 
 @st.cache_resource
@@ -69,7 +74,7 @@ def _ingest_pdfs(
     collection: str,
     extract_table_chunks: bool,
 ) -> int:
-    embed_model, _ = _load_models_cached()
+    embed_model = _embed_model_cached()
     return basic_rag.ingest_pdfs_to_qdrant(
         pdf_paths=list(pdf_paths),
         collection=collection,
@@ -85,8 +90,10 @@ def _ask(
     openai_model: str,
     qdrant_top_k: int,
     rerank_top_k: int,
+    use_reranker: bool,
 ) -> Dict[str, Any]:
-    embed_model, reranker = _load_models_cached()
+    embed_model = _embed_model_cached()
+    reranker = _reranker_cached() if use_reranker else None
     qdrant, openai_client = _clients_cached()
 
     docs = basic_rag.search_and_rerank(
@@ -94,6 +101,7 @@ def _ask(
         collection=collection,
         qdrant_top_k=qdrant_top_k,
         rerank_top_k=rerank_top_k,
+        use_reranker=use_reranker,
         embed_model=embed_model,
         reranker=reranker,
         qdrant=qdrant,
@@ -106,6 +114,7 @@ def _ask(
             docs=docs,
             openai_client=openai_client,
             model=openai_model,
+            use_reranker=use_reranker,
         )
 
     return {"answer": answer, "docs": docs}
@@ -239,17 +248,34 @@ def main() -> None:
     _load_env()
 
     st.title("📄 Table RAG (PDF → Qdrant → OpenAI)")
-    st.caption("PDF를 여러 개 선택해 한 컬렉션에 인덱싱할 수 있습니다. 질문 시 Qdrant 검색 + rerank 후 OpenAI로 답변합니다.")
+    st.caption(
+        "PDF를 여러 개 선택해 한 컬렉션에 인덱싱할 수 있습니다. 질문 시 Qdrant 검색 후, 옵션에 따라 리랭커를 거쳐 OpenAI로 답변합니다."
+    )
 
     _ensure_env_from_sidebar()
 
     with st.sidebar:
         st.subheader("RAG 설정")
-        use_rag = st.toggle("RAG 사용 (검색+rerank)", value=True)
+        use_rag = st.toggle("RAG 사용 (검색+선택적 rerank)", value=True)
         collection = st.text_input("Qdrant collection", value=os.environ.get("QDRANT_COLLECTION", basic_rag.DEFAULT_COLLECTION))
         openai_model = st.text_input("OpenAI model", value=os.environ.get("OPENAI_MODEL", basic_rag.DEFAULT_OPENAI_MODEL))
         qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=20, step=1, disabled=not use_rag)
-        rerank_top_k = st.slider("Rerank top_k", min_value=1, max_value=20, value=5, step=1, disabled=not use_rag)
+        _env_rerank = os.environ.get("USE_RERANKER", "1").strip().lower() not in {"0", "false", "no"}
+        use_reranker = st.toggle(
+            "리랭커 사용 (bge-reranker-v2-m3)",
+            value=_env_rerank,
+            disabled=not use_rag,
+            help="끄면 Qdrant 벡터 유사도만으로 상위 청크를 고릅니다. 리랭커 모델을 로드하지 않아 메모리를 덜 씁니다.",
+        )
+        rerank_top_k = st.slider(
+            "최종 컨텍스트 청크 수",
+            min_value=1,
+            max_value=20,
+            value=5,
+            step=1,
+            disabled=not use_rag,
+            help="리랭커를 켠 경우: rerank 후 이 개수만 LLM에 전달. 끈 경우: 벡터 검색 상위 이 개수.",
+        )
         extract_table_chunks = st.toggle(
             "테이블 전용 청크 추출",
             value=True,
@@ -359,13 +385,15 @@ def main() -> None:
 
         try:
             if use_rag:
-                with st.spinner("검색 + rerank + 답변 생성 중..."):
+                spin = "검색 + rerank + 답변 생성 중..." if use_reranker else "검색(벡터) + 답변 생성 중..."
+                with st.spinner(spin):
                     result = _ask(
                         question=question,
                         collection=collection,
                         openai_model=openai_model,
                         qdrant_top_k=qdrant_top_k,
                         rerank_top_k=rerank_top_k,
+                        use_reranker=use_reranker,
                     )
             else:
                 if inject_pdf_text:
@@ -395,12 +423,13 @@ def main() -> None:
                 st.markdown(answer)
                 if docs:
                     with st.expander(f"근거 청크 보기 (top {len(docs)})", expanded=False):
+                        rank_label = "rerank" if (use_rag and use_reranker) else "vector"
                         for i, d in enumerate(docs, start=1):
                             doc_label = d.get("doc") or ""
                             doc_bit = f"  doc=`{doc_label}`" if doc_label else ""
                             st.markdown(
                                 f"**[{i}]**{doc_bit}  page={d.get('page')}  chunk_id={d.get('chunk_id')}  "
-                                f"type={d.get('source_type')}  rerank={d.get('rerank_score', 0.0):.4f}"
+                                f"type={d.get('source_type')}  {rank_label}={d.get('rerank_score', 0.0):.4f}"
                             )
                             st.code(d.get("text", ""), language="text")
         except Exception as e:
