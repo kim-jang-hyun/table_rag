@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 import basic_rag
 
@@ -13,7 +15,6 @@ st.set_page_config(page_title="Table RAG", page_icon="📄", layout="wide")
 
 
 def _load_env() -> None:
-    # Single source of truth: .env (local dev)
     load_dotenv(override=False)
 
 
@@ -56,17 +57,8 @@ def _reranker_cached():
 
 
 @st.cache_resource
-def _sparse_embedder_cached():
-    if not basic_rag.is_fastembed_available():
-        return None
-    return basic_rag._load_sparse_embedder()
-
-
-@st.cache_resource
-def _clients_cached() -> Tuple[Any, Any]:
-    qdrant = basic_rag._get_qdrant_client()
-    openai_client = basic_rag._get_openai_client()
-    return qdrant, openai_client
+def _qdrant_cached():
+    return basic_rag._get_qdrant_client()
 
 
 def _list_local_pdfs(folder: Path) -> List[Path]:
@@ -84,7 +76,6 @@ def _ingest_pdfs(
     merge_cross_page_tables: bool,
 ) -> int:
     embed_model = _embed_model_cached()
-    sparse = _sparse_embedder_cached() if enable_hybrid else None
     return basic_rag.ingest_pdfs_to_qdrant(
         pdf_paths=list(pdf_paths),
         collection=collection,
@@ -92,7 +83,6 @@ def _ingest_pdfs(
         extract_table_chunks=extract_table_chunks,
         enable_hybrid=enable_hybrid,
         merge_cross_page_tables=merge_cross_page_tables,
-        sparse_embedder=sparse,
     )
 
 
@@ -108,8 +98,7 @@ def _ask(
 ) -> Dict[str, Any]:
     embed_model = _embed_model_cached()
     reranker = _reranker_cached() if use_reranker else None
-    sparse = _sparse_embedder_cached() if use_hybrid else None
-    qdrant, openai_client = _clients_cached()
+    qdrant = _qdrant_cached()
 
     docs, hybrid_warning = basic_rag.search_and_rerank(
         query=question,
@@ -120,16 +109,16 @@ def _ask(
         use_hybrid=use_hybrid,
         embed_model=embed_model,
         reranker=reranker,
-        sparse_embedder=sparse,
         qdrant=qdrant,
     )
 
     answer = ""
     if docs:
+        llm = basic_rag._get_llm(model=openai_model)
         answer = basic_rag.answer_with_openai(
             query=question,
             docs=docs,
-            openai_client=openai_client,
+            llm=llm,
             model=openai_model,
             use_reranker=use_reranker,
         )
@@ -138,20 +127,20 @@ def _ask(
 
 
 def _ask_llm_only(*, question: str, openai_model: str) -> Dict[str, Any]:
-    _, openai_client = _clients_cached()
-    system_prompt = (
-        "당신은 유능한 AI 어시스턴트입니다. 아래 질문에 한국어로 간결하고 정확하게 답하세요. "
-        "문서 컨텍스트나 검색 결과는 제공되지 않았습니다. 확실하지 않으면 모른다고 말하세요."
+    llm = basic_rag._get_llm(model=openai_model)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "당신은 유능한 AI 어시스턴트입니다. 아래 질문에 한국어로 간결하고 정확하게 답하세요. "
+                "문서 컨텍스트나 검색 결과는 제공되지 않았습니다. 확실하지 않으면 모른다고 말하세요.",
+            ),
+            ("human", "{question}"),
+        ]
     )
-    response = openai_client.responses.create(
-        model=openai_model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question},
-        ],
-        temperature=0.1,
-    )
-    return {"answer": (response.output_text or "").strip(), "docs": []}
+    chain = prompt | llm | StrOutputParser()
+    answer = chain.invoke({"question": question})
+    return {"answer": answer.strip(), "docs": []}
 
 
 def _build_pdf_context_text(
@@ -246,7 +235,6 @@ def _ask_llm_with_pdf_text(
     extract_table_chunks: bool,
     merge_cross_page_tables: bool,
 ) -> Dict[str, Any]:
-    _, openai_client = _clients_cached()
     paths = list(pdf_paths)
     if len(paths) == 1:
         context = _build_pdf_context_text(
@@ -265,20 +253,24 @@ def _ask_llm_with_pdf_text(
     if not context:
         return {"answer": "PDF에서 텍스트를 추출하지 못했습니다. (스캔 이미지 PDF일 수 있어요)", "docs": []}
 
-    system_prompt = (
-        "당신은 문서 QA 어시스턴트입니다. 반드시 제공된 컨텍스트 범위 안에서만 답하세요. "
-        "근거가 부족하면 모른다고 말하고, 추측하지 마세요."
+    llm = basic_rag._get_llm(model=openai_model)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "당신은 문서 QA 어시스턴트입니다. 반드시 제공된 컨텍스트 범위 안에서만 답하세요. "
+                "근거가 부족하면 모른다고 말하고, 추측하지 마세요.",
+            ),
+            (
+                "human",
+                "질문:\n{question}\n\n컨텍스트(문서 발췌):\n{context}\n\n"
+                "요청: 한국어로 간결하고 정확하게 답하세요.",
+            ),
+        ]
     )
-    user_prompt = f"질문:\n{question}\n\n컨텍스트(문서 발췌):\n{context}\n\n요청: 한국어로 간결하고 정확하게 답하세요."
-    response = openai_client.responses.create(
-        model=openai_model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.1,
-    )
-    return {"answer": (response.output_text or "").strip(), "docs": []}
+    chain = prompt | llm | StrOutputParser()
+    answer = chain.invoke({"question": question, "context": context})
+    return {"answer": answer.strip(), "docs": []}
 
 
 def main() -> None:
@@ -522,4 +514,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

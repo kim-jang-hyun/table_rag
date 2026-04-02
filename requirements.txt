@@ -5,3 +5,8 @@ streamlit>=1.28
 pymupdf
 sentence-transformers
 fastembed
+langchain
+langchain-openai
+langchain-qdrant
+langchain-huggingface
+langchain-community

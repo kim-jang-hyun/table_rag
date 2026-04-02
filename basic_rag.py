@@ -7,15 +7,25 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple, Union
 
 from dotenv import load_dotenv
-from openai import OpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.http import models as qm
-from qdrant_client.http.models import Distance, PointStruct, VectorParams
+
+# LangChain core
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# LangChain integrations
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_qdrant import QdrantVectorStore, RetrievalMode
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_classic.retrievers import ContextualCompressionRetriever
 
 
 DEFAULT_PDF = "[POSCO홀딩스]임원ㆍ주요주주특정증권등소유상황보고서(2026.03.10).pdf"
 DEFAULT_COLLECTION = "posco_holdings_report_2026_03_10"
-DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 HYBRID_DENSE = "dense"
 HYBRID_SPARSE = "sparse"
 DEFAULT_SPARSE_MODEL = "Qdrant/bm25"
@@ -28,6 +38,8 @@ class Chunk:
     text: str
     source_type: str
 
+
+# ── PDF extraction helpers (PyMuPDF 커스텀 – 변경 없음) ──────────────────────
 
 def _normalize_cell(value) -> str:
     if value is None:
@@ -350,6 +362,8 @@ def _chunk_text(text: str, *, chunk_size: int = 1000, chunk_overlap: int = 150) 
         start = max(0, end - chunk_overlap)
 
 
+# ── LangChain 클라이언트 / 모델 팩토리 ───────────────────────────────────────
+
 def _get_qdrant_client() -> QdrantClient:
     url = os.environ.get("QDRANT_URL", "").strip()
     api_key = os.environ.get("QDRANT_API_KEY", "").strip()
@@ -360,39 +374,25 @@ def _get_qdrant_client() -> QdrantClient:
     return QdrantClient(url=url, api_key=api_key)
 
 
-def _get_openai_client() -> OpenAI:
+def _load_embed_model() -> HuggingFaceEmbeddings:
+    """BGE-M3 밀집 임베딩 모델 (LangChain HuggingFaceEmbeddings 래퍼)."""
+    return HuggingFaceEmbeddings(
+        model_name="BAAI/bge-m3",
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+
+def _load_reranker() -> HuggingFaceCrossEncoder:
+    """BGE 리랭커 모델 (LangChain HuggingFaceCrossEncoder 래퍼)."""
+    return HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-v2-m3")
+
+
+def _get_llm(model: str = DEFAULT_OPENAI_MODEL) -> ChatOpenAI:
+    """LangChain ChatOpenAI 인스턴스 반환."""
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY (set in .env)")
-    return OpenAI(api_key=api_key)
-
-
-def _load_embed_model():
-    from sentence_transformers import SentenceTransformer
-
-    return SentenceTransformer("BAAI/bge-m3")
-
-
-def _load_reranker():
-    from sentence_transformers import CrossEncoder
-
-    return CrossEncoder("BAAI/bge-reranker-v2-m3")
-
-
-def _load_models():
-    # Lazy import to keep startup errors clearer.
-    # Using sentence-transformers avoids optional deps that require MSVC build tools on Windows.
-    return _load_embed_model(), _load_reranker()
-
-
-def _embed_texts(embed_model, texts: List[str]) -> List[List[float]]:
-    vecs = embed_model.encode(
-        texts,
-        batch_size=16,
-        show_progress_bar=len(texts) >= 32,
-        normalize_embeddings=True,
-    )
-    return vecs.tolist() if hasattr(vecs, "tolist") else vecs
+    return ChatOpenAI(model=model, temperature=0.1, api_key=api_key)
 
 
 def is_fastembed_available() -> bool:
@@ -403,55 +403,16 @@ def is_fastembed_available() -> bool:
         return False
 
 
-def _load_sparse_embedder(model_name: str = DEFAULT_SPARSE_MODEL):
-    try:
-        from fastembed import SparseTextEmbedding
-    except ImportError as exc:
-        raise RuntimeError(
-            "하이브리드(BM25)에 fastembed 패키지가 필요합니다. "
-            "`pip install fastembed` 후 다시 시도하세요. "
-            "(Windows에서는 Python 3.10~3.12 환경이 설치에 유리할 수 있습니다.)"
-        ) from exc
-
-    return SparseTextEmbedding(model_name=model_name)
-
-
-def _numpyish_to_list(x) -> List:
-    if x is None:
-        return []
-    if hasattr(x, "tolist"):
-        return x.tolist()
-    return list(x)
-
-
-def _sparse_embedding_to_qdrant(sparse_emb) -> qm.SparseVector:
-    return qm.SparseVector(
-        indices=_numpyish_to_list(getattr(sparse_emb, "indices", [])),
-        values=_numpyish_to_list(getattr(sparse_emb, "values", [])),
-    )
-
-
 def collection_is_hybrid(qdrant: QdrantClient, collection: str) -> bool:
     info = qdrant.get_collection(collection_name=collection)
     params = info.config.params
     sparse = getattr(params, "sparse_vectors", None) or {}
-    if not sparse:
-        return False
-    vecs = params.vectors
-    if isinstance(vecs, dict):
-        return HYBRID_DENSE in vecs
-    return False
+    # langchain_qdrant은 sparse 벡터를 "langchain-sparse" 키로 저장하므로
+    # sparse_vectors가 비어 있지 않으면 hybrid collection으로 판단한다.
+    return bool(sparse)
 
 
-def _sparse_vector_params() -> qm.SparseVectorParams:
-    modifier = getattr(qm, "Modifier", None)
-    if modifier is not None and hasattr(modifier, "IDF"):
-        try:
-            return qm.SparseVectorParams(modifier=modifier.IDF)
-        except Exception:
-            pass
-    return qm.SparseVectorParams()
-
+# ── 인덱싱 ──────────────────────────────────────────────────────────────────
 
 def ingest_pdfs_to_qdrant(
     *,
@@ -461,7 +422,6 @@ def ingest_pdfs_to_qdrant(
     extract_table_chunks: bool = True,
     enable_hybrid: bool = True,
     merge_cross_page_tables: bool = True,
-    sparse_embedder=None,
 ) -> int:
     paths = [Path(p).expanduser().resolve() for p in pdf_paths]
     if not paths:
@@ -488,9 +448,6 @@ def ingest_pdfs_to_qdrant(
 
     if embed_model is None:
         embed_model = _load_embed_model()
-    texts = [c.text for c in chunks]
-    vectors = _embed_texts(embed_model, texts)
-    vector_size = len(vectors[0])
 
     do_hybrid = bool(enable_hybrid) and is_fastembed_available()
     if enable_hybrid and not do_hybrid:
@@ -499,50 +456,43 @@ def ingest_pdfs_to_qdrant(
             "`pip install fastembed` 또는 Python 3.10~3.12 가상환경을 사용하세요."
         )
 
-    sparse_vectors: List[qm.SparseVector] = []
-    if do_hybrid:
-        if sparse_embedder is None:
-            sparse_embedder = _load_sparse_embedder()
-        sparse_embs = list(sparse_embedder.embed(texts, batch_size=32))
-        if len(sparse_embs) != len(chunks):
-            raise RuntimeError("Sparse embedding count does not match chunk count")
-        sparse_vectors = [_sparse_embedding_to_qdrant(s) for s in sparse_embs]
-
-    qdrant = _get_qdrant_client()
-    if qdrant.collection_exists(collection_name=collection):
-        qdrant.delete_collection(collection_name=collection)
-    if do_hybrid:
-        qdrant.create_collection(
-            collection_name=collection,
-            vectors_config={HYBRID_DENSE: VectorParams(size=vector_size, distance=Distance.COSINE)},
-            sparse_vectors_config={HYBRID_SPARSE: _sparse_vector_params()},
+    lc_docs = [
+        Document(
+            page_content=c.text,
+            metadata={
+                "doc": chunk_sources[i].name,
+                "page": c.page,
+                "chunk_id": c.chunk_id,
+                "source_type": c.source_type,
+            },
         )
+        for i, c in enumerate(chunks)
+    ]
+
+    url = os.environ.get("QDRANT_URL", "").strip()
+    api_key = os.environ.get("QDRANT_API_KEY", "").strip()
+
+    vs_kwargs: dict = dict(
+        documents=lc_docs,
+        embedding=embed_model,
+        collection_name=collection,
+        url=url,
+        api_key=api_key,
+        force_recreate=True,
+    )
+    if do_hybrid:
+        from langchain_qdrant import FastEmbedSparse
+        vs_kwargs["sparse_embedding"] = FastEmbedSparse(model_name=DEFAULT_SPARSE_MODEL)
+        vs_kwargs["retrieval_mode"] = RetrievalMode.HYBRID
     else:
-        qdrant.create_collection(
-            collection_name=collection,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
-        )
+        vs_kwargs["retrieval_mode"] = RetrievalMode.DENSE
 
-    points: List[PointStruct] = []
-    for idx, (chunk, vector, src) in enumerate(zip(chunks, vectors, chunk_sources)):
-        payload = {
-            "doc": src.name,
-            "page": chunk.page,
-            "chunk_id": chunk.chunk_id,
-            "source_type": chunk.source_type,
-            "text": chunk.text,
-        }
-        if do_hybrid:
-            vec_payload = {HYBRID_DENSE: vector, HYBRID_SPARSE: sparse_vectors[idx]}
-        else:
-            vec_payload = vector
-        points.append(PointStruct(id=idx, vector=vec_payload, payload=payload))
+    QdrantVectorStore.from_documents(**vs_kwargs)
 
-    qdrant.upsert(collection_name=collection, points=points)
     names = ", ".join(p.name for p in paths)
     mode = "hybrid dense+BM25 sparse" if do_hybrid else "dense only"
-    print(f"Upserted {len(points)} chunks ({mode}) from {len(paths)} PDF(s) into '{collection}': {names}")
-    return len(points)
+    print(f"Upserted {len(lc_docs)} chunks ({mode}) from {len(paths)} PDF(s) into '{collection}': {names}")
+    return len(lc_docs)
 
 
 def ingest_pdf_to_qdrant(
@@ -564,6 +514,8 @@ def ingest_pdf_to_qdrant(
     )
 
 
+# ── 검색 + 리랭킹 ────────────────────────────────────────────────────────────
+
 def search_and_rerank(
     *,
     query: str,
@@ -574,105 +526,88 @@ def search_and_rerank(
     use_hybrid: bool = True,
     embed_model=None,
     reranker=None,
-    sparse_embedder=None,
+    sparse_embedder=None,  # API 호환성 유지 (내부적으로 FastEmbedSparse 사용)
     qdrant=None,
 ) -> Tuple[List[dict], str]:
     if embed_model is None:
         embed_model = _load_embed_model()
-    if use_reranker and reranker is None:
-        reranker = _load_reranker()
     if qdrant is None:
         qdrant = _get_qdrant_client()
 
     hybrid_warning = ""
-    qvec = _embed_texts(embed_model, [query])[0]
     is_hybrid_col = collection_is_hybrid(qdrant, collection)
 
     if use_hybrid and is_hybrid_col and is_fastembed_available():
-        if sparse_embedder is None:
-            sparse_embedder = _load_sparse_embedder()
-        sq = list(sparse_embedder.query_embed(query))[0]
-        svec = _sparse_embedding_to_qdrant(sq)
-        resp = qdrant.query_points(
-            collection_name=collection,
-            prefetch=[
-                qm.Prefetch(query=qvec, limit=qdrant_top_k, using=HYBRID_DENSE),
-                qm.Prefetch(query=svec, limit=qdrant_top_k, using=HYBRID_SPARSE),
-            ],
-            query=qm.FusionQuery(fusion=qm.Fusion.RRF),
-            limit=qdrant_top_k,
-            with_payload=True,
-        )
-    elif use_hybrid and is_hybrid_col:
+        from langchain_qdrant import FastEmbedSparse
+        retrieval_mode = RetrievalMode.HYBRID
+        sparse = FastEmbedSparse(model_name=DEFAULT_SPARSE_MODEL)
+    elif use_hybrid and is_hybrid_col and not is_fastembed_available():
         hybrid_warning = (
             "하이브리드 collection이지만 fastembed가 없어 BM25 없이 벡터 검색만 했습니다. "
             "`pip install fastembed` 하거나 Python 3.10~3.12 가상환경을 쓰면 RRF 하이브리드를 쓸 수 있습니다."
         )
-        resp = qdrant.query_points(
-            collection_name=collection,
-            query=qvec,
-            using=HYBRID_DENSE,
-            limit=qdrant_top_k,
-            with_payload=True,
-        )
+        retrieval_mode = RetrievalMode.DENSE
+        sparse = None
     elif use_hybrid and not is_hybrid_col:
         hybrid_warning = (
             "하이브리드 검색을 켰지만 이 collection은 BM25 sparse 없이 인덱싱되었습니다. "
             "벡터 검색만 사용했습니다. 하이브리드 인덱싱을 켠 뒤 다시 인덱싱하세요."
         )
-        resp = qdrant.query_points(
-            collection_name=collection,
-            query=qvec,
-            limit=qdrant_top_k,
-            with_payload=True,
-        )
-    elif is_hybrid_col:
-        resp = qdrant.query_points(
-            collection_name=collection,
-            query=qvec,
-            using=HYBRID_DENSE,
-            limit=qdrant_top_k,
-            with_payload=True,
+        retrieval_mode = RetrievalMode.DENSE
+        sparse = None
+    else:
+        retrieval_mode = RetrievalMode.DENSE
+        sparse = None
+
+    vs_kwargs: dict = dict(
+        client=qdrant,
+        collection_name=collection,
+        embedding=embed_model,
+        retrieval_mode=retrieval_mode,
+    )
+    if sparse is not None:
+        vs_kwargs["sparse_embedding"] = sparse
+
+    vectorstore = QdrantVectorStore(**vs_kwargs)
+    base_retriever = vectorstore.as_retriever(search_kwargs={"k": qdrant_top_k})
+
+    if use_reranker:
+        if reranker is None:
+            reranker = _load_reranker()
+        compressor = CrossEncoderReranker(model=reranker, top_n=rerank_top_k)
+        retriever = ContextualCompressionRetriever(
+            base_compressor=compressor, base_retriever=base_retriever
         )
     else:
-        resp = qdrant.query_points(
-            collection_name=collection,
-            query=qvec,
-            limit=qdrant_top_k,
-            with_payload=True,
-        )
+        retriever = base_retriever
 
-    hits = resp.points
-    if not hits:
-        return [], hybrid_warning
+    results = retriever.invoke(query)
 
     docs = []
-    for h in hits:
-        payload = h.payload or {}
+    for doc in results:
+        meta = doc.metadata or {}
+        # reranker 적용 후: relevance_score / 미적용: _relevance_score (Qdrant 기본)
+        rerank_score = float(meta.get("relevance_score", meta.get("_relevance_score", 0.0)))
         docs.append(
             {
-                "score": float(h.score),
-                "doc": payload.get("doc", ""),
-                "page": payload.get("page"),
-                "chunk_id": payload.get("chunk_id"),
-                "source_type": payload.get("source_type", "text"),
-                "text": payload.get("text", ""),
+                "score": float(meta.get("_relevance_score", 0.0)),
+                "rerank_score": rerank_score,
+                "doc": meta.get("doc", ""),
+                "page": meta.get("page"),
+                "chunk_id": meta.get("chunk_id"),
+                "source_type": meta.get("source_type", "text"),
+                "text": doc.page_content,
             }
         )
 
-    if use_reranker and reranker is not None:
-        pairs = [[query, d["text"]] for d in docs]
-        rerank_scores = reranker.predict(pairs)
-        for d, s in zip(docs, rerank_scores):
-            d["rerank_score"] = float(s)
-        docs.sort(key=lambda x: x["rerank_score"], reverse=True)
-    else:
-        for d in docs:
-            d["rerank_score"] = float(d["score"])
-        docs.sort(key=lambda x: x["score"], reverse=True)
+    # 리랭커 미사용 시 rerank_top_k로 직접 슬라이싱 (reranker는 top_n으로 이미 제한됨)
+    if not use_reranker:
+        docs = docs[:rerank_top_k]
 
-    return docs[:rerank_top_k], hybrid_warning
+    return docs, hybrid_warning
 
+
+# ── 컨텍스트 빌더 ─────────────────────────────────────────────────────────────
 
 def _build_context_from_docs(docs: List[dict], *, use_reranker: bool = True) -> str:
     lines: List[str] = []
@@ -689,11 +624,13 @@ def _build_context_from_docs(docs: List[dict], *, use_reranker: bool = True) -> 
     return "\n".join(lines).strip()
 
 
+# ── LLM 답변 생성 (LCEL 체인) ─────────────────────────────────────────────────
+
 def answer_with_openai(
     *,
     query: str,
     docs: List[dict],
-    openai_client: OpenAI,
+    llm: ChatOpenAI,
     model: str = DEFAULT_OPENAI_MODEL,
     use_reranker: bool = True,
 ) -> str:
@@ -701,27 +638,26 @@ def answer_with_openai(
     if not context:
         return "검색된 컨텍스트가 없어 답변을 생성할 수 없습니다."
 
-    system_prompt = (
-        "당신은 문서 QA 어시스턴트입니다. 반드시 제공된 컨텍스트 범위 안에서만 답하세요. "
-        "근거가 부족하면 모른다고 말하고, 추측하지 마세요. "
-        "가능하면 답변 끝에 근거 청크 번호([1], [2]...)를 표시하세요."
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "당신은 문서 QA 어시스턴트입니다. 반드시 제공된 컨텍스트 범위 안에서만 답하세요. "
+                "근거가 부족하면 모른다고 말하고, 추측하지 마세요. "
+                "가능하면 답변 끝에 근거 청크 번호([1], [2]...)를 표시하세요.",
+            ),
+            (
+                "human",
+                "질문:\n{query}\n\n컨텍스트:\n{context}\n\n"
+                "요청: 질문에 한국어로 간결하고 정확하게 답하세요.",
+            ),
+        ]
     )
-    user_prompt = (
-        f"질문:\n{query}\n\n"
-        f"컨텍스트:\n{context}\n\n"
-        "요청: 질문에 한국어로 간결하고 정확하게 답하세요."
-    )
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"query": query, "context": context})
 
-    response = openai_client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.1,
-    )
-    return (response.output_text or "").strip()
 
+# ── CLI 진입점 ───────────────────────────────────────────────────────────────
 
 def main():
     # Help Windows terminals display Korean properly when possible.
@@ -770,12 +706,10 @@ def main():
             "밀집 벡터만 사용합니다. `pip install fastembed` 또는 Python 3.10~3.12 venv를 권장합니다."
         )
 
-    # Load models once and reuse for interactive Q&A.
     embed_model = _load_embed_model()
     reranker = _load_reranker() if use_reranker else None
-    sparse_embedder = _load_sparse_embedder() if use_hybrid else None
     qdrant = _get_qdrant_client()
-    openai_client = _get_openai_client()
+    llm = _get_llm(model=openai_model)
 
     if ingest_on_start:
         mode = "bge-m3 + BM25 sparse (hybrid)" if want_hybrid else "bge-m3 (dense only)"
@@ -808,7 +742,6 @@ def main():
             use_hybrid=want_hybrid,
             embed_model=embed_model,
             reranker=reranker,
-            sparse_embedder=sparse_embedder,
             qdrant=qdrant,
         )
         if hybrid_warn:
@@ -829,7 +762,7 @@ def main():
         llm_answer = answer_with_openai(
             query=user_q,
             docs=top,
-            openai_client=openai_client,
+            llm=llm,
             model=openai_model,
             use_reranker=use_reranker,
         )
