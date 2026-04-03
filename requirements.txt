@@ -10,3 +10,4 @@ langchain-openai
 langchain-qdrant
 langchain-huggingface
 langchain-community
+reportlab
