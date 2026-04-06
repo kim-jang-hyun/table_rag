@@ -5,3 +5,4 @@ __pycache__/
 .streamlit/secrets.toml
 .qdrant/
 *.log
+.streamlit_uploads/
