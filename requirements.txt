@@ -11,3 +11,5 @@ langchain-qdrant
 langchain-huggingface
 langchain-community
 reportlab
+langgraph
+tavily-python

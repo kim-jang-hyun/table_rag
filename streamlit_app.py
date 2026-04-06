@@ -1,17 +1,22 @@
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 
 import streamlit as st
 from dotenv import load_dotenv
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 
 import basic_rag
+import rag_agent
 
 
 st.set_page_config(page_title="Table RAG", page_icon="📄", layout="wide")
+
+_SOURCE_LABELS: Dict[str, str] = {
+    "rag_generate": "📄 RAG 검색 (벡터 DB)",
+    "web_direct": "🌐 웹 검색 (직접 호출)",
+    "web_fallback": "🌐 웹 검색 (폴백 — 문서 부족)",
+}
 
 
 def _load_env() -> None:
@@ -37,6 +42,11 @@ def _ensure_env_from_sidebar() -> None:
             value=os.environ.get("OPENAI_API_KEY", ""),
             type="password",
         )
+        tavily_api_key = st.text_input(
+            "TAVILY_API_KEY",
+            value=os.environ.get("TAVILY_API_KEY", ""),
+            type="password",
+        )
 
         if qdrant_url.strip():
             os.environ["QDRANT_URL"] = qdrant_url.strip()
@@ -44,6 +54,8 @@ def _ensure_env_from_sidebar() -> None:
             os.environ["QDRANT_API_KEY"] = qdrant_api_key.strip()
         if openai_api_key.strip():
             os.environ["OPENAI_API_KEY"] = openai_api_key.strip()
+        if tavily_api_key.strip():
+            os.environ["TAVILY_API_KEY"] = tavily_api_key.strip()
 
 
 @st.cache_resource
@@ -86,7 +98,7 @@ def _ingest_pdfs(
     )
 
 
-def _ask(
+def _ask_with_agent(
     *,
     question: str,
     collection: str,
@@ -96,101 +108,30 @@ def _ask(
     use_reranker: bool,
     use_hybrid: bool,
 ) -> Dict[str, Any]:
-    embed_model = _embed_model_cached()
-    reranker = _reranker_cached() if use_reranker else None
-    qdrant = _qdrant_cached()
-
-    docs, hybrid_warning = basic_rag.search_and_rerank(
-        query=question,
-        collection=collection,
-        qdrant_top_k=qdrant_top_k,
-        rerank_top_k=rerank_top_k,
-        use_reranker=use_reranker,
-        use_hybrid=use_hybrid,
-        embed_model=embed_model,
-        reranker=reranker,
-        qdrant=qdrant,
-    )
-
-    answer = ""
-    if docs:
-        llm = basic_rag._get_llm(model=openai_model)
-        answer = basic_rag.answer_with_openai(
-            query=question,
-            docs=docs,
-            llm=llm,
-            model=openai_model,
-            use_reranker=use_reranker,
-        )
-
-    return {"answer": answer, "docs": docs, "hybrid_warning": hybrid_warning}
-
-
-def _ask_llm_only(*, question: str, openai_model: str) -> Dict[str, Any]:
-    llm = basic_rag._get_llm(model=openai_model)
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "당신은 유능한 AI 어시스턴트입니다. 아래 질문에 한국어로 간결하고 정확하게 답하세요. "
-                "문서 컨텍스트나 검색 결과는 제공되지 않았습니다. 확실하지 않으면 모른다고 말하세요.",
-            ),
-            ("human", "{question}"),
-        ]
-    )
-    chain = prompt | llm | StrOutputParser()
-    answer = chain.invoke({"question": question})
-    return {"answer": answer.strip(), "docs": []}
-
-
-def _build_pdf_context_text(
-    *,
-    pdf_path: Path,
-    max_chars: int,
-    extract_table_chunks: bool,
-    merge_cross_page_tables: bool,
-) -> str:
-    chunks = basic_rag._load_pdf_sections(
-        pdf_path,
-        extract_table_chunks=extract_table_chunks,
-        merge_cross_page_tables=merge_cross_page_tables,
-    )
-    if not chunks:
-        return ""
-    parts: List[str] = []
-    for c in chunks:
-        parts.append(f"[page={c.page} type={c.source_type} chunk_id={c.chunk_id}]")
-        parts.append(c.text)
-        parts.append("")
-    context = "\n".join(parts).strip()
-    if max_chars and len(context) > max_chars:
-        context = context[:max_chars].rstrip() + "\n\n...(truncated)"
-    return context
-
-
-def _build_pdf_context_text_many(
-    *,
-    pdf_paths: Sequence[Path],
-    max_chars: int,
-    extract_table_chunks: bool,
-    merge_cross_page_tables: bool,
-) -> str:
-    blocks: List[str] = []
-    for p in pdf_paths:
-        body = _build_pdf_context_text(
-            pdf_path=p,
-            max_chars=0,
-            extract_table_chunks=extract_table_chunks,
-            merge_cross_page_tables=merge_cross_page_tables,
-        )
-        if body:
-            blocks.append(f"### 문서: {p.name}\n{body}")
-    combined = "\n\n".join(blocks).strip()
-    if not combined:
-        return ""
-    if max_chars and len(combined) > max_chars:
-        combined = combined[:max_chars].rstrip() + "\n\n...(truncated)"
-    return combined
+    initial_state: rag_agent.AgentState = {
+        "question": question,
+        "route": "",
+        "documents": [],
+        "grade": "",
+        "answer": "",
+        "source": "",
+        "hybrid_warning": "",
+        "collection": collection,
+        "use_reranker": use_reranker,
+        "use_hybrid": use_hybrid,
+        "qdrant_top_k": qdrant_top_k,
+        "rerank_top_k": rerank_top_k,
+        "openai_model": openai_model,
+    }
+    result = rag_agent.agent.invoke(initial_state)
+    return {
+        "answer": result.get("answer", ""),
+        "docs": result.get("documents", []),
+        "source": result.get("source", ""),
+        "route": result.get("route", ""),
+        "grade": result.get("grade", ""),
+        "hybrid_warning": result.get("hybrid_warning", ""),
+    }
 
 
 def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
@@ -226,82 +167,40 @@ def _default_selected_pdf_names(names: List[str]) -> List[str]:
     return [n for n in picked if n in names]
 
 
-def _ask_llm_with_pdf_text(
-    *,
-    question: str,
-    openai_model: str,
-    pdf_paths: Sequence[Path],
-    max_context_chars: int,
-    extract_table_chunks: bool,
-    merge_cross_page_tables: bool,
-) -> Dict[str, Any]:
-    paths = list(pdf_paths)
-    if len(paths) == 1:
-        context = _build_pdf_context_text(
-            pdf_path=paths[0],
-            max_chars=max_context_chars,
-            extract_table_chunks=extract_table_chunks,
-            merge_cross_page_tables=merge_cross_page_tables,
-        )
-    else:
-        context = _build_pdf_context_text_many(
-            pdf_paths=paths,
-            max_chars=max_context_chars,
-            extract_table_chunks=extract_table_chunks,
-            merge_cross_page_tables=merge_cross_page_tables,
-        )
-    if not context:
-        return {"answer": "PDF에서 텍스트를 추출하지 못했습니다. (스캔 이미지 PDF일 수 있어요)", "docs": []}
-
-    llm = basic_rag._get_llm(model=openai_model)
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "당신은 문서 QA 어시스턴트입니다. 반드시 제공된 컨텍스트 범위 안에서만 답하세요. "
-                "근거가 부족하면 모른다고 말하고, 추측하지 마세요.",
-            ),
-            (
-                "human",
-                "질문:\n{question}\n\n컨텍스트(문서 발췌):\n{context}\n\n"
-                "요청: 한국어로 간결하고 정확하게 답하세요.",
-            ),
-        ]
-    )
-    chain = prompt | llm | StrOutputParser()
-    answer = chain.invoke({"question": question, "context": context})
-    return {"answer": answer.strip(), "docs": []}
-
-
 def main() -> None:
     _load_env()
 
-    st.title("📄 Table RAG (PDF → Qdrant → OpenAI)")
+    st.title("📄 Table RAG (PDF → Qdrant → LangGraph)")
     st.caption(
-        "PDF를 여러 개 인덱싱할 수 있습니다. 옵션으로 하이브리드(의미 벡터 + BM25 키워드, RRF), 리랭커, OpenAI 답변을 사용합니다."
+        "LangGraph 기반 라우팅: PDF 관련 질문은 벡터 DB 검색(RAG), "
+        "일반/문서 부족 질문은 Tavily 웹검색(Web RAG)으로 자동 분기합니다."
     )
 
     _ensure_env_from_sidebar()
 
     with st.sidebar:
         st.subheader("RAG 설정")
-        use_rag = st.toggle("RAG 사용 (검색+선택적 rerank)", value=True)
+
         hybrid_ok = basic_rag.is_fastembed_available()
-        if use_rag and not hybrid_ok:
+        if not hybrid_ok:
             st.caption(
                 "참고: fastembed가 없어 BM25 하이브리드는 동작하지 않습니다. "
-                "같은 venv에서 `pip install fastembed` 후 앱을 다시 실행하세요. "
-                "설치가 안 되면 **Python 3.11** 가상환경을 만드는 것을 권장합니다."
+                "같은 venv에서 `pip install fastembed` 후 앱을 다시 실행하세요."
             )
-        collection = st.text_input("Qdrant collection", value=os.environ.get("QDRANT_COLLECTION", basic_rag.DEFAULT_COLLECTION))
-        openai_model = st.text_input("OpenAI model", value=os.environ.get("OPENAI_MODEL", basic_rag.DEFAULT_OPENAI_MODEL))
-        qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=20, step=1, disabled=not use_rag)
+        collection = st.text_input(
+            "Qdrant collection",
+            value=os.environ.get("QDRANT_COLLECTION", basic_rag.DEFAULT_COLLECTION),
+        )
+        openai_model = st.text_input(
+            "OpenAI model",
+            value=os.environ.get("OPENAI_MODEL", basic_rag.DEFAULT_OPENAI_MODEL),
+        )
+        qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=20, step=1)
         _env_rerank = os.environ.get("USE_RERANKER", "1").strip().lower() not in {"0", "false", "no"}
         use_reranker = st.toggle(
             "리랭커 사용 (bge-reranker-v2-m3)",
             value=_env_rerank,
-            disabled=not use_rag,
-            help="끄면 Qdrant 벡터 유사도만으로 상위 청크를 고릅니다. 리랭커 모델을 로드하지 않아 메모리를 덜 씁니다.",
+            help="끄면 Qdrant 벡터 유사도만으로 상위 청크를 고릅니다.",
         )
         rerank_top_k = st.slider(
             "최종 컨텍스트 청크 수",
@@ -309,20 +208,18 @@ def main() -> None:
             max_value=20,
             value=5,
             step=1,
-            disabled=not use_rag,
-            help="리랭커를 켠 경우: rerank 후 이 개수만 LLM에 전달. 끈 경우: 벡터 검색 상위 이 개수.",
+            help="리랭커를 켠 경우: rerank 후 이 개수만 LLM에 전달. 끈 경우: 벡터 상위 이 개수.",
         )
         _default_hybrid = os.environ.get("USE_HYBRID", "1").strip().lower() not in {"0", "false", "no"}
         use_hybrid = st.toggle(
-            "하이브리드 (BM25 + 벡터, 인덱싱·검색)",
+            "하이브리드 (BM25 + 벡터)",
             value=_default_hybrid,
-            disabled=not use_rag,
-            help="켜면 인덱싱 시 dense+BM25 sparse를 함께 저장하고, 검색 시 RRF로 결합합니다. 끄면 밀집 벡터만 사용합니다. 켠 뒤에는 인덱싱을 다시 실행하세요.",
+            help="켜면 dense+BM25 sparse를 RRF로 결합합니다. 변경 후 재인덱싱하세요.",
         )
         extract_table_chunks = st.toggle(
             "테이블 전용 청크 추출",
             value=True,
-            help="끄면 구조화된 표 청크(source_type=table)는 만들지 않고, 페이지 전체 텍스트 청크만 사용합니다. 변경 후 인덱싱을 다시 실행하세요.",
+            help="끄면 페이지 전체 텍스트 청크만 사용합니다. 변경 후 재인덱싱하세요.",
         )
         _env_mcp = os.environ.get("MERGE_CROSS_PAGE_TABLES", "1").strip().lower() not in {
             "0",
@@ -332,8 +229,8 @@ def main() -> None:
         merge_cross_page_tables = st.toggle(
             "페이지 간 표 병합",
             value=_env_mcp,
-            disabled=not use_rag or (not extract_table_chunks),
-            help="켜면 여러 페이지에 걸친 표를 가능한 한 하나의 table 청크로 합칩니다. 끄면 페이지마다 잡힌 표 조각만 사용합니다. 변경 후 인덱싱을 다시 실행하세요.",
+            disabled=not extract_table_chunks,
+            help="켜면 여러 페이지에 걸친 표를 하나의 청크로 합칩니다. 변경 후 재인덱싱하세요.",
         )
 
         st.subheader("PDF")
@@ -380,25 +277,13 @@ def main() -> None:
 
         pdf_paths = _dedupe_paths(list(folder_paths) + upload_paths + fallback)
 
-        st.subheader("비RAG(문서 직접 주입) 설정")
-        inject_pdf_text = st.toggle("RAG 꺼도 PDF 텍스트를 LLM에 넣기", value=False, disabled=use_rag)
-        max_context_chars = st.slider(
-            "PDF 컨텍스트 최대 글자 수",
-            min_value=2_000,
-            max_value=120_000,
-            value=20_000,
-            step=1_000,
-            disabled=use_rag or (not inject_pdf_text),
-        )
-
         ingest_clicked = st.button(
             "인덱싱(업서트) 실행",
             type="primary",
             use_container_width=True,
-            disabled=not use_rag,
         )
 
-    if ingest_clicked and use_rag:
+    if ingest_clicked:
         try:
             if not pdf_paths:
                 st.error("인덱싱할 PDF가 없습니다. 폴더에서 선택하거나 파일을 업로드하세요.")
@@ -433,7 +318,7 @@ def main() -> None:
     st.divider()
 
     if "chat" not in st.session_state:
-        st.session_state.chat = []  # type: ignore[attr-defined]
+        st.session_state.chat = []
 
     for msg in st.session_state.chat:
         with st.chat_message(msg["role"]):
@@ -446,60 +331,33 @@ def main() -> None:
             st.markdown(question)
 
         try:
-            if use_rag:
-                if use_hybrid and use_reranker:
-                    spin = "하이브리드(RRF) 검색 + rerank + 답변 생성 중..."
-                elif use_hybrid:
-                    spin = "하이브리드(RRF) 검색 + 답변 생성 중..."
-                elif use_reranker:
-                    spin = "검색 + rerank + 답변 생성 중..."
-                else:
-                    spin = "검색(벡터) + 답변 생성 중..."
-                with st.spinner(spin):
-                    result = _ask(
-                        question=question,
-                        collection=collection,
-                        openai_model=openai_model,
-                        qdrant_top_k=qdrant_top_k,
-                        rerank_top_k=rerank_top_k,
-                        use_reranker=use_reranker,
-                        use_hybrid=use_hybrid,
-                    )
-            else:
-                if inject_pdf_text:
-                    usable = [p for p in pdf_paths if p.exists()]
-                    if not usable:
-                        result = {
-                            "answer": "PDF를 찾을 수 없습니다. 사이드바에서 파일을 선택하거나 업로드하세요.",
-                            "docs": [],
-                        }
-                    else:
-                        with st.spinner("LLM 답변 생성 중 (비RAG: PDF 텍스트 직접 주입)..."):
-                            result = _ask_llm_with_pdf_text(
-                                question=question,
-                                openai_model=openai_model,
-                                pdf_paths=usable,
-                                max_context_chars=max_context_chars,
-                                extract_table_chunks=extract_table_chunks,
-                                merge_cross_page_tables=(
-                                    merge_cross_page_tables and extract_table_chunks
-                                ),
-                            )
-                else:
-                    with st.spinner("LLM 답변 생성 중 (RAG 미사용: 문서 없음)..."):
-                        result = _ask_llm_only(question=question, openai_model=openai_model)
+            with st.spinner("라우팅 및 답변 생성 중..."):
+                result = _ask_with_agent(
+                    question=question,
+                    collection=collection,
+                    openai_model=openai_model,
+                    qdrant_top_k=qdrant_top_k,
+                    rerank_top_k=rerank_top_k,
+                    use_reranker=use_reranker,
+                    use_hybrid=use_hybrid,
+                )
+
             answer = result["answer"] or "검색 결과가 없거나 답변 생성에 실패했습니다."
-            docs = result["docs"] or []
+            docs = result.get("docs") or []
             hwarn = result.get("hybrid_warning") or ""
+            source = result.get("source", "")
+            source_label = _SOURCE_LABELS.get(source, source)
 
             st.session_state.chat.append({"role": "assistant", "content": answer})
             with st.chat_message("assistant"):
                 if hwarn:
                     st.warning(hwarn)
                 st.markdown(answer)
+                if source_label:
+                    st.caption(f"경로: {source_label}")
                 if docs:
                     with st.expander(f"근거 청크 보기 (top {len(docs)})", expanded=False):
-                        rank_label = "rerank" if (use_rag and use_reranker) else "vector"
+                        rank_label = "rerank" if use_reranker else "vector"
                         for i, d in enumerate(docs, start=1):
                             doc_label = d.get("doc") or ""
                             doc_bit = f"  doc=`{doc_label}`" if doc_label else ""
