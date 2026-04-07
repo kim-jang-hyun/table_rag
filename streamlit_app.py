@@ -3,6 +3,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
+_APP_DIR = Path(__file__).parent
+
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -159,12 +161,10 @@ def _default_selected_pdf_names(names: List[str]) -> List[str]:
             stem = Path(part.strip()).name
             if stem in names:
                 picked.append(stem)
-    default_pdf = os.environ.get("PDF_PATH", basic_rag.DEFAULT_PDF)
-    if not picked and default_pdf in names:
-        picked = [default_pdf]
-    if not picked:
-        picked = [names[0]]
-    return [n for n in picked if n in names]
+    if picked:
+        return [n for n in picked if n in names]
+    # PDF_FOLDER 기반으로 관리하는 경우: 폴더 내 전체 PDF를 기본 선택
+    return list(names)
 
 
 def main() -> None:
@@ -234,7 +234,9 @@ def main() -> None:
         )
 
         st.subheader("PDF")
-        pdf_folder = Path(os.environ.get("PDF_FOLDER", ".")).resolve()
+        _pdf_folder_env = os.environ.get("PDF_FOLDER", "테스트문서")
+        _pdf_folder_raw = Path(_pdf_folder_env)
+        pdf_folder = (_pdf_folder_raw if _pdf_folder_raw.is_absolute() else _APP_DIR / _pdf_folder_raw).resolve()
         pdfs = _list_local_pdfs(pdf_folder)
         default_pdf = os.environ.get("PDF_PATH", basic_rag.DEFAULT_PDF)
 

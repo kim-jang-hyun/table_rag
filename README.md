@@ -38,7 +38,10 @@ PDF_FOLDER=테스트문서
 ### 실행
 
 ```bash
-# Streamlit UI (권장)
+# Streamlit 접속 (운영환경)
+https://tablerag-ci.streamlit.app/
+
+# Streamlit UI 로컬 실행
 streamlit run streamlit_app.py
 
 # CLI (basic_rag.py 단독)
