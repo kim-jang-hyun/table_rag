@@ -295,9 +295,9 @@ def main() -> None:
                     st.error("PDF를 찾을 수 없습니다:\n" + "\n".join(missing))
                 else:
                     spin = (
-                        f"{len(pdf_paths)}개 PDF → 밀집+BM25 임베딩 후 Qdrant 업서트..."
+                        f"{len(pdf_paths)}개 PDF → 의미+키워드 임베딩 후 Qdrant 업서트..."
                         if use_hybrid
-                        else f"{len(pdf_paths)}개 PDF를 읽고 임베딩한 뒤 Qdrant에 업서트 중..."
+                        else f"{len(pdf_paths)}개 PDF → 의미 임베딩 후 Qdrant 업서트..."
                     )
                     with st.spinner(spin):
                         n_chunks = _ingest_pdfs(
@@ -310,7 +310,7 @@ def main() -> None:
                             ),
                         )
                     doc_list = ", ".join(p.name for p in pdf_paths)
-                    mode = "하이브리드 (dense+BM25)" if use_hybrid else "밀집 벡터만"
+                    mode = "하이브리드 (의미+키워드)" if use_hybrid else "의미 벡터만"
                     st.success(
                         f"인덱싱 완료 ({mode}). PDF {len(pdf_paths)}개 · 청크 {n_chunks:,}개 · collection: `{collection}`\n\n{doc_list}"
                     )

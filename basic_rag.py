@@ -47,6 +47,52 @@ def _normalize_cell(value) -> str:
     return " ".join(str(value).split())
 
 
+def _has_colspan_pattern(row: List[str]) -> bool:
+    """인접한 셀에 동일 값이 반복되면 colspan으로 판단 (PyMuPDF는 colspan을 동일 값 반복으로 채움)."""
+    for i in range(len(row) - 1):
+        if row[i] and row[i] == row[i + 1]:
+            return True
+    return False
+
+
+def _is_mostly_non_numeric(row: List[str]) -> bool:
+    """행의 비어있지 않은 셀 중 절반 이상이 숫자가 아니면 True (헤더 행 판별용)."""
+    non_empty = [c for c in row if c]
+    if not non_empty:
+        return False
+    numeric = sum(1 for c in non_empty if re.match(r'^[\d,.\s\-+%()]+$', c))
+    return numeric / len(non_empty) < 0.5
+
+
+def _is_likely_subheader(row0: List[str], row1: List[str]) -> bool:
+    """row0에 colspan 패턴이 있고, row1도 헤더처럼 보일 때 2단 헤더로 판단."""
+    if len(row0) != len(row1):
+        return False
+    return _has_colspan_pattern(row0) and _is_mostly_non_numeric(row1)
+
+
+def _combine_header_rows(row0: List[str], row1: List[str]) -> List[str]:
+    """
+    2단 헤더를 1단으로 합침.
+    - 부모=자식 (rowspan) → 값 하나만 사용
+    - 부모만 있음           → 부모 사용
+    - 자식만 있음           → 자식 사용
+    - 둘 다 다름 (colspan)  → "부모_자식" (예: "매출_국내")
+    """
+    combined = []
+    for i, (parent, child) in enumerate(zip(row0, row1)):
+        parent, child = parent.strip(), child.strip()
+        if parent == child:
+            combined.append(parent or f"col{i + 1}")
+        elif not child:
+            combined.append(parent or f"col{i + 1}")
+        elif not parent:
+            combined.append(child)
+        else:
+            combined.append(f"{parent}_{child}")
+    return combined
+
+
 def _table_to_text(
     table_rows: List[List[str]],
     table_title: str = "",
@@ -57,8 +103,23 @@ def _table_to_text(
     if not table_rows:
         return ""
 
-    header = table_rows[0]
-    body = table_rows[1:]
+    # N단 헤더(colspan) 자동 감지: 연속된 헤더 행을 모두 병합
+    header_depth = 1
+    while (
+        header_depth < len(table_rows) - 1
+        and _is_likely_subheader(table_rows[header_depth - 1], table_rows[header_depth])
+    ):
+        header_depth += 1
+
+    if header_depth > 1:
+        header = table_rows[0]
+        for i in range(1, header_depth):
+            header = _combine_header_rows(header, table_rows[i])
+        body = table_rows[header_depth:]
+    else:
+        header = table_rows[0]
+        body = table_rows[1:]
+
     lines: List[str] = []
     lines.append("TABLE")
     if table_title:
