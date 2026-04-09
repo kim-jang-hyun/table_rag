@@ -16,8 +16,7 @@ st.set_page_config(page_title="Table RAG", page_icon="📄", layout="wide")
 
 _SOURCE_LABELS: Dict[str, str] = {
     "rag_generate": "📄 RAG 검색 (벡터 DB)",
-    "web_direct": "🌐 웹 검색 (직접 호출)",
-    "web_fallback": "🌐 웹 검색 (폴백 — 문서 부족)",
+    "web_fallback": "🌐 웹 검색 (문서 부족 시 폴백)",
 }
 
 
@@ -172,9 +171,22 @@ def main() -> None:
 
     st.title("📄 Table RAG (PDF → Qdrant → LangGraph)")
     st.caption(
-        "LangGraph 기반 라우팅: PDF 관련 질문은 벡터 DB 검색(RAG), "
-        "일반/문서 부족 질문은 Tavily 웹검색(Web RAG)으로 자동 분기합니다."
+        "모든 질문은 먼저 벡터 DB(RAG)에서 검색하고, 관련 문서가 부족할 때만 Tavily 웹검색으로 폴백합니다."
     )
+
+    # 모델 로딩 완료 여부를 세션에 기록해 로딩 중 질문 입력을 차단합니다.
+    if "models_ready" not in st.session_state:
+        st.session_state.models_ready = False
+
+    if not st.session_state.models_ready:
+        with st.spinner("모델 로딩 중... 잠시만 기다려 주세요. (bge-m3, reranker, BM25)"):
+            _embed_model_cached()
+            _reranker_cached()
+            _qdrant_cached()
+            if basic_rag.is_fastembed_available():
+                basic_rag._load_sparse_embedder()
+        st.session_state.models_ready = True
+        st.rerun()
 
     _ensure_env_from_sidebar()
 
@@ -195,7 +207,7 @@ def main() -> None:
             "OpenAI model",
             value=os.environ.get("OPENAI_MODEL", basic_rag.DEFAULT_OPENAI_MODEL),
         )
-        qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=20, step=1)
+        qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=5, step=1)
         _env_rerank = os.environ.get("USE_RERANKER", "1").strip().lower() not in {"0", "false", "no"}
         use_reranker = st.toggle(
             "리랭커 사용 (bge-reranker-v2-m3)",
@@ -326,7 +338,11 @@ def main() -> None:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    question = st.chat_input("질문을 입력하세요")
+    models_ready = st.session_state.get("models_ready", False)
+    question = st.chat_input(
+        "질문을 입력하세요",
+        disabled=not models_ready,
+    )
     if question:
         st.session_state.chat.append({"role": "user", "content": question})
         with st.chat_message("user"):

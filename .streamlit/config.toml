@@ -1,0 +1,8 @@
+[server]
+# 파일 감시자를 끄면 transformers 라이브러리 스캔 시 발생하는
+# torchvision 관련 수백 줄의 경고가 터미널에 출력되지 않습니다.
+# 코드 변경 후 자동 리로드는 없으므로 직접 재시작하세요.
+fileWatcherType = "none"
+
+[logger]
+level = "error"

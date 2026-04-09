@@ -425,27 +425,51 @@ def _chunk_text(text: str, *, chunk_size: int = 1000, chunk_overlap: int = 150) 
 
 # ── LangChain 클라이언트 / 모델 팩토리 ───────────────────────────────────────
 
+_qdrant_client_singleton: QdrantClient | None = None
+_sparse_embedder_singleton = None  # FastEmbedSparse (optional dep)
+_embed_model_singleton: HuggingFaceEmbeddings | None = None
+_reranker_singleton: HuggingFaceCrossEncoder | None = None
+
+
 def _get_qdrant_client() -> QdrantClient:
-    url = os.environ.get("QDRANT_URL", "").strip()
-    api_key = os.environ.get("QDRANT_API_KEY", "").strip()
-    if not url:
-        raise RuntimeError("Missing QDRANT_URL (set in .env)")
-    if not api_key or api_key == "PASTE_YOUR_QDRANT_API_KEY_HERE":
-        raise RuntimeError("Missing QDRANT_API_KEY (set in .env)")
-    return QdrantClient(url=url, api_key=api_key)
+    global _qdrant_client_singleton
+    if _qdrant_client_singleton is None:
+        url = os.environ.get("QDRANT_URL", "").strip()
+        api_key = os.environ.get("QDRANT_API_KEY", "").strip()
+        if not url:
+            raise RuntimeError("Missing QDRANT_URL (set in .env)")
+        if not api_key or api_key == "PASTE_YOUR_QDRANT_API_KEY_HERE":
+            raise RuntimeError("Missing QDRANT_API_KEY (set in .env)")
+        _qdrant_client_singleton = QdrantClient(url=url, api_key=api_key)
+    return _qdrant_client_singleton
+
+
+def _load_sparse_embedder():
+    """BM25 sparse 임베딩 모델 (프로세스 내 싱글턴으로 재사용)."""
+    global _sparse_embedder_singleton
+    if _sparse_embedder_singleton is None:
+        from langchain_qdrant import FastEmbedSparse
+        _sparse_embedder_singleton = FastEmbedSparse(model_name=DEFAULT_SPARSE_MODEL)
+    return _sparse_embedder_singleton
 
 
 def _load_embed_model() -> HuggingFaceEmbeddings:
-    """BGE-M3 밀집 임베딩 모델 (LangChain HuggingFaceEmbeddings 래퍼)."""
-    return HuggingFaceEmbeddings(
-        model_name="BAAI/bge-m3",
-        encode_kwargs={"normalize_embeddings": True},
-    )
+    """BGE-M3 밀집 임베딩 모델 (프로세스 내 싱글턴으로 재사용)."""
+    global _embed_model_singleton
+    if _embed_model_singleton is None:
+        _embed_model_singleton = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-m3",
+            encode_kwargs={"normalize_embeddings": True},
+        )
+    return _embed_model_singleton
 
 
 def _load_reranker() -> HuggingFaceCrossEncoder:
-    """BGE 리랭커 모델 (LangChain HuggingFaceCrossEncoder 래퍼)."""
-    return HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-v2-m3")
+    """BGE 리랭커 모델 (프로세스 내 싱글턴으로 재사용)."""
+    global _reranker_singleton
+    if _reranker_singleton is None:
+        _reranker_singleton = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-v2-m3")
+    return _reranker_singleton
 
 
 def _get_llm(model: str = DEFAULT_OPENAI_MODEL) -> ChatOpenAI:
@@ -542,8 +566,7 @@ def ingest_pdfs_to_qdrant(
         force_recreate=True,
     )
     if do_hybrid:
-        from langchain_qdrant import FastEmbedSparse
-        vs_kwargs["sparse_embedding"] = FastEmbedSparse(model_name=DEFAULT_SPARSE_MODEL)
+        vs_kwargs["sparse_embedding"] = _load_sparse_embedder()
         vs_kwargs["retrieval_mode"] = RetrievalMode.HYBRID
     else:
         vs_kwargs["retrieval_mode"] = RetrievalMode.DENSE
@@ -595,13 +618,13 @@ def search_and_rerank(
     if qdrant is None:
         qdrant = _get_qdrant_client()
 
+    import time as _time
     hybrid_warning = ""
     is_hybrid_col = collection_is_hybrid(qdrant, collection)
 
     if use_hybrid and is_hybrid_col and is_fastembed_available():
-        from langchain_qdrant import FastEmbedSparse
         retrieval_mode = RetrievalMode.HYBRID
-        sparse = FastEmbedSparse(model_name=DEFAULT_SPARSE_MODEL)
+        sparse = _load_sparse_embedder()
     elif use_hybrid and is_hybrid_col and not is_fastembed_available():
         hybrid_warning = (
             "하이브리드 collection이지만 fastembed가 없어 BM25 없이 벡터 검색만 했습니다. "
@@ -642,7 +665,12 @@ def search_and_rerank(
     else:
         retriever = base_retriever
 
+    import logging as _logging
+    _pl = _logging.getLogger("table_rag.perf")
+    _pl.info(f"[search] 시작 (top_k={qdrant_top_k}, reranker={use_reranker}, hybrid={retrieval_mode})")
+    t0 = _time.time()
     results = retriever.invoke(query)
+    _pl.info(f"[search] 완료 ({_time.time()-t0:.1f}s) — 결과 {len(results)}개")
 
     docs = []
     for doc in results:
