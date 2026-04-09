@@ -48,9 +48,15 @@ def _normalize_cell(value) -> str:
 
 
 def _has_colspan_pattern(row: List[str]) -> bool:
-    """인접한 셀에 동일 값이 반복되면 colspan으로 판단 (PyMuPDF는 colspan을 동일 값 반복으로 채움)."""
+    """
+    colspan 패턴 감지. PyMuPDF의 두 가지 동작을 모두 처리:
+    - 값 반복: ["매출", "매출", "매출"]
+    - 빈 문자열: ["매출", "", ""]
+    """
     for i in range(len(row) - 1):
-        if row[i] and row[i] == row[i + 1]:
+        if row[i] and row[i] == row[i + 1]:   # 값 반복
+            return True
+        if row[i] and not row[i + 1]:          # 값 뒤에 빈 셀
             return True
     return False
 
@@ -74,23 +80,61 @@ def _is_likely_subheader(row0: List[str], row1: List[str]) -> bool:
 def _combine_header_rows(row0: List[str], row1: List[str]) -> List[str]:
     """
     2단 헤더를 1단으로 합침.
-    - 부모=자식 (rowspan) → 값 하나만 사용
-    - 부모만 있음           → 부모 사용
-    - 자식만 있음           → 자식 사용
-    - 둘 다 다름 (colspan)  → "부모_자식" (예: "매출_국내")
+    - 부모=자식 (rowspan)         → 값 하나만 사용
+    - 부모만 있음                  → 부모 사용
+    - 자식만 있음                  → 자식 사용
+    - 둘 다 다름 (colspan)         → "부모_자식" (예: "매출_국내")
+    - 부모가 빈 문자열 (colspan 연속) → 앞 부모값을 승계해 "부모_자식" 생성
     """
     combined = []
+    last_parent = ""
     for i, (parent, child) in enumerate(zip(row0, row1)):
         parent, child = parent.strip(), child.strip()
-        if parent == child:
-            combined.append(parent or f"col{i + 1}")
+        # 부모가 비어있으면 앞 colspan 부모를 승계
+        effective_parent = parent if parent else last_parent
+        if parent:
+            last_parent = parent
+
+        if effective_parent == child:
+            combined.append(effective_parent or f"col{i + 1}")
         elif not child:
-            combined.append(parent or f"col{i + 1}")
-        elif not parent:
+            combined.append(effective_parent or f"col{i + 1}")
+        elif not effective_parent:
             combined.append(child)
         else:
-            combined.append(f"{parent}_{child}")
+            combined.append(f"{effective_parent}_{child}")
     return combined
+
+
+def _fill_rowspan_cells(body: List[List[str]]) -> List[List[str]]:
+    """
+    PyMuPDF는 rowspan 병합 셀 값을 스팬의 마지막 행에 배치하고
+    앞 행들은 빈 문자열로 둡니다. 빈 셀 구간을 뒤에 오는 값으로 소급 채웁니다.
+
+    예) ["", "A-1", ...] / ["A계열", "A-2", ...] → ["A계열", "A-1", ...] / ["A계열", "A-2", ...]
+    """
+    if not body:
+        return body
+    n_cols = max(len(r) for r in body)
+    result = [list(r) + [""] * (n_cols - len(r)) for r in body]
+    n_rows = len(result)
+
+    for col in range(n_cols):
+        i = 0
+        while i < n_rows:
+            if not result[i][col]:
+                # 빈 구간 시작 — 다음 비어있지 않은 셀을 찾아 소급 채움
+                j = i + 1
+                while j < n_rows and not result[j][col]:
+                    j += 1
+                if j < n_rows:
+                    # [i, j-1] 범위를 result[j][col] 값으로 채움
+                    for k in range(i, j):
+                        result[k][col] = result[j][col]
+                i = j + 1
+            else:
+                i += 1
+    return result
 
 
 def _table_to_text(
@@ -119,6 +163,9 @@ def _table_to_text(
     else:
         header = table_rows[0]
         body = table_rows[1:]
+
+    # rowspan 빈 셀 소급 채우기
+    body = _fill_rowspan_cells(body)
 
     lines: List[str] = []
     lines.append("TABLE")
