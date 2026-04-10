@@ -1,16 +1,36 @@
+"""Streamlit UI for the Table RAG agent.
+
+Run from the project root::
+
+    streamlit run app/streamlit_app.py
+"""
+
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-_APP_DIR = Path(__file__).parent
+# Allow ``import rag_agent`` from the same directory when running via
+# ``streamlit run app/streamlit_app.py`` (Streamlit adds the script directory
+# to sys.path automatically, but we add it explicitly for safety).
+sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
 from dotenv import load_dotenv
 
-import basic_rag
+import table_rag
 import rag_agent
+from table_rag.models import (
+    get_qdrant_client,
+    is_fastembed_available,
+    load_embed_model,
+    load_reranker,
+    load_sparse_embedder,
+)
 
+# Project root — used to resolve relative folder paths from the sidebar.
+_PROJECT_ROOT = Path(__file__).parent.parent
 
 st.set_page_config(page_title="Table RAG 기반 검색 Agent", page_icon="📄", layout="wide")
 
@@ -61,17 +81,17 @@ def _ensure_env_from_sidebar() -> None:
 
 @st.cache_resource
 def _embed_model_cached():
-    return basic_rag._load_embed_model()
+    return load_embed_model()
 
 
 @st.cache_resource
 def _reranker_cached():
-    return basic_rag._load_reranker()
+    return load_reranker()
 
 
 @st.cache_resource
 def _qdrant_cached():
-    return basic_rag._get_qdrant_client()
+    return get_qdrant_client()
 
 
 _SUPPORTED_EXTENSIONS = (".pdf", ".pptx", ".ppt")
@@ -95,7 +115,7 @@ def _ingest_pdfs(
     merge_cross_page_tables: bool,
 ) -> int:
     embed_model = _embed_model_cached()
-    return basic_rag.ingest_pdfs_to_qdrant(
+    return table_rag.ingest_pdfs_to_qdrant(
         pdf_paths=list(pdf_paths),
         collection=collection,
         embed_model=embed_model,
@@ -114,7 +134,7 @@ def _upsert_doc(
     merge_cross_page_tables: bool,
 ) -> int:
     embed_model = _embed_model_cached()
-    return basic_rag.upsert_document_to_qdrant(
+    return table_rag.upsert_document_to_qdrant(
         doc_path=doc_path,
         collection=collection,
         embed_model=embed_model,
@@ -175,22 +195,6 @@ def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
     return out
 
 
-def _default_selected_pdf_names(names: List[str]) -> List[str]:
-    if not names:
-        return []
-    raw = os.environ.get("PDF_PATHS", "").strip()
-    picked: List[str] = []
-    if raw:
-        for part in re.split(r"[,;\n]+", raw):
-            stem = Path(part.strip()).name
-            if stem in names:
-                picked.append(stem)
-    if picked:
-        return [n for n in picked if n in names]
-    # PDF_FOLDER 기반으로 관리하는 경우: 폴더 내 전체 PDF를 기본 선택
-    return list(names)
-
-
 def main() -> None:
     _load_env()
 
@@ -199,7 +203,6 @@ def main() -> None:
         "모든 질문은 먼저 벡터 DB(RAG)에서 검색하고, 관련 문서가 부족할 때만 Tavily 웹검색으로 폴백합니다."
     )
 
-    # 모델 로딩 완료 여부를 세션에 기록해 로딩 중 질문 입력을 차단합니다.
     if "models_ready" not in st.session_state:
         st.session_state.models_ready = False
 
@@ -208,8 +211,8 @@ def main() -> None:
             _embed_model_cached()
             _reranker_cached()
             _qdrant_cached()
-            if basic_rag.is_fastembed_available():
-                basic_rag._load_sparse_embedder()
+            if is_fastembed_available():
+                load_sparse_embedder()
         st.session_state.models_ready = True
         st.rerun()
 
@@ -218,7 +221,7 @@ def main() -> None:
     with st.sidebar:
         st.subheader("RAG 설정")
 
-        hybrid_ok = basic_rag.is_fastembed_available()
+        hybrid_ok = is_fastembed_available()
         if not hybrid_ok:
             st.caption(
                 "참고: fastembed가 없어 BM25 하이브리드는 동작하지 않습니다. "
@@ -226,11 +229,11 @@ def main() -> None:
             )
         collection = st.text_input(
             "Qdrant collection",
-            value=os.environ.get("QDRANT_COLLECTION", basic_rag.DEFAULT_COLLECTION),
+            value=os.environ.get("QDRANT_COLLECTION", table_rag.DEFAULT_COLLECTION),
         )
         openai_model = st.text_input(
             "OpenAI model",
-            value=os.environ.get("OPENAI_MODEL", basic_rag.DEFAULT_OPENAI_MODEL),
+            value=os.environ.get("OPENAI_MODEL", table_rag.DEFAULT_OPENAI_MODEL),
         )
         qdrant_top_k = st.slider("Qdrant top_k", min_value=5, max_value=50, value=5, step=1)
         _env_rerank = os.environ.get("USE_RERANKER", "1").strip().lower() not in {"0", "false", "no"}
@@ -259,9 +262,7 @@ def main() -> None:
             help="끄면 페이지 전체 텍스트 청크만 사용합니다. 변경 후 재인덱싱하세요.",
         )
         _env_mcp = os.environ.get("MERGE_CROSS_PAGE_TABLES", "1").strip().lower() not in {
-            "0",
-            "false",
-            "no",
+            "0", "false", "no",
         }
         merge_cross_page_tables = st.toggle(
             "페이지 간 표 병합",
@@ -273,9 +274,14 @@ def main() -> None:
         st.subheader("문서")
         _pdf_folder_env = os.environ.get("PDF_FOLDER", "테스트문서")
         _pdf_folder_raw = Path(_pdf_folder_env)
-        pdf_folder = (_pdf_folder_raw if _pdf_folder_raw.is_absolute() else _APP_DIR / _pdf_folder_raw).resolve()
+        pdf_folder = (
+            _pdf_folder_raw
+            if _pdf_folder_raw.is_absolute()
+            else (_PROJECT_ROOT / _pdf_folder_raw)
+        ).resolve()
+
         docs = _list_local_docs(pdf_folder)
-        default_pdf = os.environ.get("PDF_PATH", basic_rag.DEFAULT_PDF)
+        default_pdf = os.environ.get("PDF_PATH", table_rag.DEFAULT_PDF)
 
         folder_paths: List[Path] = []
         if docs:
@@ -283,12 +289,15 @@ def main() -> None:
             selected_names = st.multiselect(
                 "로컬 문서 선택 (복수 가능)",
                 options=names,
-                default=names,  # 항상 폴더 내 전체 문서를 기본 선택
+                default=names,
                 help="같은 collection에 선택한 모든 문서(PDF/PPT)를 함께 인덱싱합니다.",
             )
             folder_paths = [pdf_folder / n for n in selected_names]
         else:
-            st.info("현재 폴더에서 문서를 찾지 못했어요. 아래 업로더를 사용하거나, PDF/PPT 파일을 프로젝트 폴더에 두세요.")
+            st.info(
+                "현재 폴더에서 문서를 찾지 못했어요. "
+                "아래 업로더를 사용하거나 PDF/PPT 파일을 프로젝트 폴더에 두세요."
+            )
             if not Path(default_pdf).exists():
                 st.caption(f"단일 경로 힌트: `PDF_PATH={default_pdf}` (파일이 없으면 업로드만 사용)")
 
@@ -358,7 +367,6 @@ def main() -> None:
                     st.success(
                         f"추가 완료 ({mode}). `{doc_path.name}` · 청크 {n_chunks:,}개 → collection: `{collection}`"
                     )
-                # 인덱싱 완료 후 파일 업로더 초기화
                 st.session_state.uploader_key += 1
                 st.rerun()
         except Exception as e:
@@ -391,7 +399,8 @@ def main() -> None:
                     doc_list = ", ".join(p.name for p in pdf_paths)
                     mode = "하이브리드 (의미+키워드)" if use_hybrid else "의미 벡터만"
                     st.success(
-                        f"인덱싱 완료 ({mode}). 문서 {len(pdf_paths)}개 · 청크 {n_chunks:,}개 · collection: `{collection}`\n\n{doc_list}"
+                        f"인덱싱 완료 ({mode}). 문서 {len(pdf_paths)}개 · 청크 {n_chunks:,}개 · "
+                        f"collection: `{collection}`\n\n{doc_list}"
                     )
         except Exception as e:
             st.exception(e)
@@ -406,10 +415,8 @@ def main() -> None:
             st.markdown(msg["content"])
 
     models_ready = st.session_state.get("models_ready", False)
-    question = st.chat_input(
-        "질문을 입력하세요",
-        disabled=not models_ready,
-    )
+    question = st.chat_input("질문을 입력하세요", disabled=not models_ready)
+
     if question:
         st.session_state.chat.append({"role": "user", "content": question})
         with st.chat_message("user"):
@@ -447,8 +454,10 @@ def main() -> None:
                             doc_label = d.get("doc") or ""
                             doc_bit = f"  doc=`{doc_label}`" if doc_label else ""
                             st.markdown(
-                                f"**[{i}]**{doc_bit}  page={d.get('page')}  chunk_id={d.get('chunk_id')}  "
-                                f"type={d.get('source_type')}  {rank_label}={d.get('rerank_score', 0.0):.4f}"
+                                f"**[{i}]**{doc_bit}  page={d.get('page')}  "
+                                f"chunk_id={d.get('chunk_id')}  "
+                                f"type={d.get('source_type')}  "
+                                f"{rank_label}={d.get('rerank_score', 0.0):.4f}"
                             )
                             st.code(d.get("text", ""), language="text")
         except Exception as e:

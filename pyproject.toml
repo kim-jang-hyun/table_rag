@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "table-rag"
+version = "0.1.0"
+description = "Table-aware RAG pipeline for PDF/PPTX documents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf",
+    "python-pptx",
+    "python-dotenv",
+    "langchain",
+    "langchain-core",
+    "langchain-openai",
+    "langchain-huggingface",
+    "langchain-qdrant",
+    "langchain-community",
+    "langchain-classic",
+    "qdrant-client>=1.10.0",
+    "sentence-transformers",
+    "openai",
+]
+
+[project.optional-dependencies]
+# BM25 hybrid retrieval (requires Python 3.10-3.12)
+hybrid = ["fastembed"]
+# Streamlit UI + LangGraph agent + web search fallback
+app = ["streamlit>=1.28", "langgraph", "tavily-python"]
+# All extras
+all = ["table-rag[hybrid,app]"]
+
+[project.scripts]
+table-rag = "table_rag.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["table_rag*"]
