@@ -456,6 +456,99 @@ def _chunks_for_pdf(
     return prefixed
 
 
+# ── PPTX extraction (python-pptx) ────────────────────────────────────────────
+
+def _load_pptx_sections(
+    pptx_path: Path,
+    *,
+    extract_table_chunks: bool = True,
+) -> List[Chunk]:
+    """PPTX 파일에서 텍스트·테이블 청크를 추출합니다 (python-pptx 사용)."""
+    try:
+        from pptx import Presentation  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "python-pptx가 설치되지 않았습니다. `pip install python-pptx`를 실행하세요."
+        ) from exc
+
+    prs = Presentation(str(pptx_path))
+    chunks: List[Chunk] = []
+
+    for slide_idx, slide in enumerate(prs.slides, start=1):
+        slide_texts: List[str] = []
+        for shape in slide.shapes:
+            if extract_table_chunks and shape.has_table:
+                rows: List[List[str]] = [
+                    [_normalize_cell(cell.text) for cell in row.cells]
+                    for row in shape.table.rows
+                ]
+                table_text = _table_to_text(rows, start_page=slide_idx, end_page=slide_idx)
+                if table_text:
+                    chunks.append(
+                        Chunk(
+                            chunk_id=f"p{slide_idx:04d}_tb{len(chunks)+1:03d}",
+                            page=slide_idx,
+                            text=table_text,
+                            source_type="table",
+                        )
+                    )
+            elif shape.has_text_frame:
+                t = shape.text_frame.text.strip()
+                if t:
+                    slide_texts.append(t)
+
+        full_text = " ".join(slide_texts)
+        full_text = " ".join(full_text.split())
+        if full_text:
+            for j, piece in enumerate(_chunk_text(full_text), start=1):
+                if piece:
+                    chunks.append(
+                        Chunk(
+                            chunk_id=f"p{slide_idx:04d}_t{j:03d}",
+                            page=slide_idx,
+                            text=piece,
+                            source_type="text",
+                        )
+                    )
+
+    return chunks
+
+
+
+def _chunks_for_document(
+    doc_path: Path,
+    *,
+    doc_slug: str,
+    extract_table_chunks: bool = True,
+    merge_cross_page_tables: bool = True,
+) -> List[Chunk]:
+    """확장자에 따라 PDF 또는 PPTX 로더를 자동 선택해 청크를 반환합니다."""
+    ext = doc_path.suffix.lower()
+    if ext == ".pdf":
+        raw = _load_pdf_sections(
+            doc_path,
+            extract_table_chunks=extract_table_chunks,
+            merge_cross_page_tables=merge_cross_page_tables,
+        )
+    elif ext in (".pptx", ".ppt"):
+        raw = _load_pptx_sections(
+            doc_path,
+            extract_table_chunks=extract_table_chunks,
+        )
+    else:
+        raise ValueError(f"지원하지 않는 파일 형식입니다: '{ext}' (지원: .pdf, .pptx, .ppt)")
+
+    return [
+        Chunk(
+            chunk_id=f"{doc_slug}::{c.chunk_id}",
+            page=c.page,
+            text=c.text,
+            source_type=c.source_type,
+        )
+        for c in raw
+    ]
+
+
 def _chunk_text(text: str, *, chunk_size: int = 1000, chunk_overlap: int = 150) -> Iterable[str]:
     if chunk_overlap >= chunk_size:
         raise ValueError("chunk_overlap must be < chunk_size")
@@ -557,24 +650,27 @@ def ingest_pdfs_to_qdrant(
 ) -> int:
     paths = [Path(p).expanduser().resolve() for p in pdf_paths]
     if not paths:
-        raise ValueError("No PDF paths provided")
+        raise ValueError("No document paths provided")
 
     missing = [str(p) for p in paths if not p.exists()]
     if missing:
-        raise FileNotFoundError("PDF not found:\n" + "\n".join(missing))
+        raise FileNotFoundError("파일을 찾을 수 없습니다:\n" + "\n".join(missing))
 
     slugs = _assign_doc_slugs(paths)
     chunks: List[Chunk] = []
     chunk_sources: List[Path] = []
     for p in paths:
-        doc_chunks = _chunks_for_pdf(
+        doc_chunks = _chunks_for_document(
             p,
             doc_slug=slugs[p],
             extract_table_chunks=extract_table_chunks,
             merge_cross_page_tables=merge_cross_page_tables,
         )
         if not doc_chunks:
-            raise RuntimeError(f"No text extracted from PDF: {p.name} (스캔 이미지 PDF일 수 있음)")
+            raise RuntimeError(
+                f"'{p.name}'에서 텍스트를 추출하지 못했습니다. "
+                "(스캔 이미지 PDF이거나 내용이 없는 파일일 수 있음)"
+            )
         chunks.extend(doc_chunks)
         chunk_sources.extend([p] * len(doc_chunks))
 
@@ -620,9 +716,17 @@ def ingest_pdfs_to_qdrant(
 
     QdrantVectorStore.from_documents(**vs_kwargs)
 
+    # upsert_document_to_qdrant() 의 scroll/delete 필터를 위해 keyword 인덱스 생성 (멱등)
+    from qdrant_client.http.models import PayloadSchemaType
+    _get_qdrant_client().create_payload_index(
+        collection_name=collection,
+        field_name="metadata.doc",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+
     names = ", ".join(p.name for p in paths)
     mode = "hybrid dense+BM25 sparse" if do_hybrid else "dense only"
-    print(f"Upserted {len(lc_docs)} chunks ({mode}) from {len(paths)} PDF(s) into '{collection}': {names}")
+    print(f"Upserted {len(lc_docs)} chunks ({mode}) from {len(paths)} doc(s) into '{collection}': {names}")
     return len(lc_docs)
 
 
@@ -643,6 +747,137 @@ def ingest_pdf_to_qdrant(
         enable_hybrid=enable_hybrid,
         merge_cross_page_tables=merge_cross_page_tables,
     )
+
+
+def upsert_document_to_qdrant(
+    *,
+    doc_path: Union[Path, str],
+    collection: str = DEFAULT_COLLECTION,
+    embed_model=None,
+    extract_table_chunks: bool = True,
+    enable_hybrid: bool = True,
+    merge_cross_page_tables: bool = True,
+) -> int:
+    """기존 collection에 단일 문서를 추가(교체)합니다.
+
+    collection 전체를 초기화하지 않고, 해당 문서의 청크만 삭제 후 새로 삽입합니다.
+    collection이 없으면 새로 생성합니다.
+    """
+    from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+    doc_path = Path(doc_path).expanduser().resolve()
+    if not doc_path.exists():
+        raise FileNotFoundError(f"파일을 찾을 수 없습니다: {doc_path}")
+
+    doc_slug = _sanitize_doc_stem(doc_path.stem)
+    chunks = _chunks_for_document(
+        doc_path,
+        doc_slug=doc_slug,
+        extract_table_chunks=extract_table_chunks,
+        merge_cross_page_tables=merge_cross_page_tables,
+    )
+    if not chunks:
+        raise RuntimeError(
+            f"'{doc_path.name}'에서 텍스트를 추출하지 못했습니다. "
+            "(스캔 이미지 PDF이거나 내용이 없는 파일일 수 있음)"
+        )
+
+    if embed_model is None:
+        embed_model = _load_embed_model()
+
+    do_hybrid = bool(enable_hybrid) and is_fastembed_available()
+
+    url = os.environ.get("QDRANT_URL", "").strip()
+    api_key = os.environ.get("QDRANT_API_KEY", "").strip()
+    qdrant = _get_qdrant_client()
+
+    # 기존 collection에서 해당 문서의 청크를 삭제
+    # Qdrant Cloud는 필터 연산(scroll/delete) 시 payload 인덱스가 필요합니다.
+    # collection이 있으면 먼저 keyword 인덱스를 생성(멱등)한 뒤 scroll → ID 삭제합니다.
+    from qdrant_client.http.models import PayloadSchemaType
+
+    existing = [c.name for c in qdrant.get_collections().collections]
+    if collection in existing:
+        qdrant.create_payload_index(
+            collection_name=collection,
+            field_name="metadata.doc",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+        ids_to_delete: list = []
+        offset = None
+        while True:
+            results, offset = qdrant.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="metadata.doc",
+                            match=MatchValue(value=doc_path.name),
+                        )
+                    ]
+                ),
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            ids_to_delete.extend(r.id for r in results)
+            if offset is None:
+                break
+        if ids_to_delete:
+            qdrant.delete(
+                collection_name=collection,
+                points_selector=ids_to_delete,
+            )
+
+    lc_docs = [
+        Document(
+            page_content=c.text,
+            metadata={
+                "doc": doc_path.name,
+                "page": c.page,
+                "chunk_id": c.chunk_id,
+                "source_type": c.source_type,
+            },
+        )
+        for c in chunks
+    ]
+
+    if collection not in existing:
+        # collection 신규 생성
+        vs_kwargs: dict = dict(
+            documents=lc_docs,
+            embedding=embed_model,
+            collection_name=collection,
+            url=url,
+            api_key=api_key,
+            force_recreate=False,
+        )
+        if do_hybrid:
+            vs_kwargs["sparse_embedding"] = _load_sparse_embedder()
+            vs_kwargs["retrieval_mode"] = RetrievalMode.HYBRID
+        else:
+            vs_kwargs["retrieval_mode"] = RetrievalMode.DENSE
+        QdrantVectorStore.from_documents(**vs_kwargs)
+    else:
+        # 기존 collection에 추가
+        # QdrantVectorStore(client=...) 는 url/api_key 를 받지 않으므로 제외
+        vs_kwargs = dict(
+            client=qdrant,
+            collection_name=collection,
+            embedding=embed_model,
+        )
+        if do_hybrid:
+            vs_kwargs["sparse_embedding"] = _load_sparse_embedder()
+            vs_kwargs["retrieval_mode"] = RetrievalMode.HYBRID
+        else:
+            vs_kwargs["retrieval_mode"] = RetrievalMode.DENSE
+        vs = QdrantVectorStore(**vs_kwargs)
+        vs.add_documents(lc_docs)
+
+    mode = "hybrid dense+BM25 sparse" if do_hybrid else "dense only"
+    print(f"Upserted {len(lc_docs)} chunks ({mode}) for '{doc_path.name}' into '{collection}'")
+    return len(lc_docs)
 
 
 # ── 검색 + 리랭킹 ────────────────────────────────────────────────────────────

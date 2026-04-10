@@ -12,7 +12,7 @@ import basic_rag
 import rag_agent
 
 
-st.set_page_config(page_title="Table RAG", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Table RAG 기반 검색 Agent", page_icon="📄", layout="wide")
 
 _SOURCE_LABELS: Dict[str, str] = {
     "rag_generate": "📄 RAG 검색 (벡터 DB)",
@@ -74,10 +74,16 @@ def _qdrant_cached():
     return basic_rag._get_qdrant_client()
 
 
-def _list_local_pdfs(folder: Path) -> List[Path]:
+_SUPPORTED_EXTENSIONS = (".pdf", ".pptx", ".ppt")
+
+
+def _list_local_docs(folder: Path) -> List[Path]:
     if not folder.exists():
         return []
-    return sorted([p for p in folder.glob("*.pdf") if p.is_file()])
+    return sorted([
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in _SUPPORTED_EXTENSIONS
+    ])
 
 
 def _ingest_pdfs(
@@ -91,6 +97,25 @@ def _ingest_pdfs(
     embed_model = _embed_model_cached()
     return basic_rag.ingest_pdfs_to_qdrant(
         pdf_paths=list(pdf_paths),
+        collection=collection,
+        embed_model=embed_model,
+        extract_table_chunks=extract_table_chunks,
+        enable_hybrid=enable_hybrid,
+        merge_cross_page_tables=merge_cross_page_tables,
+    )
+
+
+def _upsert_doc(
+    *,
+    doc_path: Path,
+    collection: str,
+    extract_table_chunks: bool,
+    enable_hybrid: bool,
+    merge_cross_page_tables: bool,
+) -> int:
+    embed_model = _embed_model_cached()
+    return basic_rag.upsert_document_to_qdrant(
+        doc_path=doc_path,
         collection=collection,
         embed_model=embed_model,
         extract_table_chunks=extract_table_chunks,
@@ -169,7 +194,7 @@ def _default_selected_pdf_names(names: List[str]) -> List[str]:
 def main() -> None:
     _load_env()
 
-    st.title("📄 Table RAG (PDF → Qdrant → LangGraph)")
+    st.title("📄 Table RAG 기반 검색 Agent")
     st.caption(
         "모든 질문은 먼저 벡터 DB(RAG)에서 검색하고, 관련 문서가 부족할 때만 Tavily 웹검색으로 폴백합니다."
     )
@@ -245,43 +270,53 @@ def main() -> None:
             help="켜면 여러 페이지에 걸친 표를 하나의 청크로 합칩니다. 변경 후 재인덱싱하세요.",
         )
 
-        st.subheader("PDF")
+        st.subheader("문서")
         _pdf_folder_env = os.environ.get("PDF_FOLDER", "테스트문서")
         _pdf_folder_raw = Path(_pdf_folder_env)
         pdf_folder = (_pdf_folder_raw if _pdf_folder_raw.is_absolute() else _APP_DIR / _pdf_folder_raw).resolve()
-        pdfs = _list_local_pdfs(pdf_folder)
+        docs = _list_local_docs(pdf_folder)
         default_pdf = os.environ.get("PDF_PATH", basic_rag.DEFAULT_PDF)
 
         folder_paths: List[Path] = []
-        if pdfs:
-            names = [p.name for p in pdfs]
-            default_names = _default_selected_pdf_names(names)
+        if docs:
+            names = [p.name for p in docs]
             selected_names = st.multiselect(
-                "로컬 PDF 선택 (복수 가능)",
+                "로컬 문서 선택 (복수 가능)",
                 options=names,
-                default=default_names,
-                help="같은 collection에 선택한 모든 PDF를 함께 인덱싱합니다.",
+                default=names,  # 항상 폴더 내 전체 문서를 기본 선택
+                help="같은 collection에 선택한 모든 문서(PDF/PPT)를 함께 인덱싱합니다.",
             )
             folder_paths = [pdf_folder / n for n in selected_names]
         else:
-            st.info("현재 폴더에서 PDF를 찾지 못했어요. 아래 업로더를 사용하거나, PDF를 프로젝트 폴더에 두세요.")
+            st.info("현재 폴더에서 문서를 찾지 못했어요. 아래 업로더를 사용하거나, PDF/PPT 파일을 프로젝트 폴더에 두세요.")
             if not Path(default_pdf).exists():
                 st.caption(f"단일 경로 힌트: `PDF_PATH={default_pdf}` (파일이 없으면 업로드만 사용)")
 
-        upload_dir = Path(".streamlit_uploads")
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        if "uploader_key" not in st.session_state:
+            st.session_state.uploader_key = 0
+
         uploaded_list = st.file_uploader(
-            "또는 PDF 업로드 (복수 가능)",
-            type=["pdf"],
+            "또는 문서 업로드 (PDF / PPT / PPTX, 복수 가능)",
+            type=["pdf", "pptx", "ppt"],
             accept_multiple_files=True,
+            key=f"file_uploader_{st.session_state.uploader_key}",
+            help="업로드한 파일은 테스트문서 폴더에 저장되고, VectorDB에 추가(기존 컬렉션 유지)됩니다.",
         )
         upload_paths: List[Path] = []
         if uploaded_list:
+            pdf_folder.mkdir(parents=True, exist_ok=True)
             for up in uploaded_list:
-                dest = upload_dir / up.name
+                dest = pdf_folder / up.name
                 dest.write_bytes(up.getbuffer())
                 upload_paths.append(dest)
-            st.success(f"업로드 완료: {len(upload_paths)}개 파일")
+            st.success(f"업로드 완료: {len(upload_paths)}개 파일 → `{pdf_folder.name}/`")
+
+        upsert_clicked = st.button(
+            "업로드 파일 추가 인덱싱",
+            disabled=not upload_paths,
+            use_container_width=True,
+            help="업로드한 파일만 VectorDB에 추가합니다. 기존 컬렉션은 유지됩니다.",
+        )
 
         fallback: List[Path] = []
         if not folder_paths and not upload_paths:
@@ -289,27 +324,59 @@ def main() -> None:
             if p.exists():
                 fallback = [p]
 
-        pdf_paths = _dedupe_paths(list(folder_paths) + upload_paths + fallback)
+        pdf_paths = _dedupe_paths(list(folder_paths) + fallback)
 
         ingest_clicked = st.button(
-            "인덱싱(업서트) 실행",
+            "인덱싱(전체 재구성) 실행",
             type="primary",
             use_container_width=True,
+            help="선택한 로컬 문서로 컬렉션을 초기화 후 재인덱싱합니다.",
         )
+
+    if upsert_clicked:
+        try:
+            if not upload_paths:
+                st.error("추가할 업로드 파일이 없습니다.")
+            else:
+                for doc_path in upload_paths:
+                    spin = (
+                        f"'{doc_path.name}' → 의미+키워드 임베딩 후 Qdrant 추가..."
+                        if use_hybrid
+                        else f"'{doc_path.name}' → 의미 임베딩 후 Qdrant 추가..."
+                    )
+                    with st.spinner(spin):
+                        n_chunks = _upsert_doc(
+                            doc_path=doc_path,
+                            collection=collection,
+                            extract_table_chunks=extract_table_chunks,
+                            enable_hybrid=use_hybrid,
+                            merge_cross_page_tables=(
+                                merge_cross_page_tables and extract_table_chunks
+                            ),
+                        )
+                    mode = "하이브리드 (의미+키워드)" if use_hybrid else "의미 벡터만"
+                    st.success(
+                        f"추가 완료 ({mode}). `{doc_path.name}` · 청크 {n_chunks:,}개 → collection: `{collection}`"
+                    )
+                # 인덱싱 완료 후 파일 업로더 초기화
+                st.session_state.uploader_key += 1
+                st.rerun()
+        except Exception as e:
+            st.exception(e)
 
     if ingest_clicked:
         try:
             if not pdf_paths:
-                st.error("인덱싱할 PDF가 없습니다. 폴더에서 선택하거나 파일을 업로드하세요.")
+                st.error("인덱싱할 문서가 없습니다. 폴더에서 선택하거나 파일을 업로드하세요.")
             else:
                 missing = [str(p) for p in pdf_paths if not p.exists()]
                 if missing:
-                    st.error("PDF를 찾을 수 없습니다:\n" + "\n".join(missing))
+                    st.error("파일을 찾을 수 없습니다:\n" + "\n".join(missing))
                 else:
                     spin = (
-                        f"{len(pdf_paths)}개 PDF → 의미+키워드 임베딩 후 Qdrant 업서트..."
+                        f"{len(pdf_paths)}개 문서 → 의미+키워드 임베딩 후 Qdrant 업서트..."
                         if use_hybrid
-                        else f"{len(pdf_paths)}개 PDF → 의미 임베딩 후 Qdrant 업서트..."
+                        else f"{len(pdf_paths)}개 문서 → 의미 임베딩 후 Qdrant 업서트..."
                     )
                     with st.spinner(spin):
                         n_chunks = _ingest_pdfs(
@@ -324,7 +391,7 @@ def main() -> None:
                     doc_list = ", ".join(p.name for p in pdf_paths)
                     mode = "하이브리드 (의미+키워드)" if use_hybrid else "의미 벡터만"
                     st.success(
-                        f"인덱싱 완료 ({mode}). PDF {len(pdf_paths)}개 · 청크 {n_chunks:,}개 · collection: `{collection}`\n\n{doc_list}"
+                        f"인덱싱 완료 ({mode}). 문서 {len(pdf_paths)}개 · 청크 {n_chunks:,}개 · collection: `{collection}`\n\n{doc_list}"
                     )
         except Exception as e:
             st.exception(e)

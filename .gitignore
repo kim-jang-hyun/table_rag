@@ -6,3 +6,12 @@ __pycache__/
 .qdrant/
 *.log
 .streamlit_uploads/
+
+# Cursor IDE 관련
+.agents/
+skills-lock.json
+# 일회성 유틸리티 스크립트
+pdf_to_pptx.py
+
+#etc
+테스트문서 - 복사본/

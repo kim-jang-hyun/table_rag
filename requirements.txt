@@ -10,6 +10,8 @@ langchain-openai
 langchain-qdrant
 langchain-huggingface
 langchain-community
+langchain-classic
 reportlab
 langgraph
 tavily-python
+python-pptx
