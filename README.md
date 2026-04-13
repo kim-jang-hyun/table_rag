@@ -662,6 +662,12 @@ python tools/pdf_to_pptx.py
 Streamlit Cloud → 앱 설정 → **Secrets** 탭에 `.env` 내용을 추가합니다.
 `PDF_FOLDER`는 기본값이 `테스트문서`로 설정돼 있으므로, GitHub 저장소에 해당 폴더가 있으면 별도 설정 없이 자동 인식됩니다.
 
+**Python 버전 고정**: 저장소 루트의 `runtime.txt`에 버전이 지정되어 있습니다.
+
+```
+python-3.11
+```
+
 ### 동작 흐름
 
 1. 사이드바에서 문서(PDF/PPTX/PPT) 선택 또는 업로드
