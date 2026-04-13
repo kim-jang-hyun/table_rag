@@ -215,7 +215,6 @@ def main() -> None:
         with st.spinner("모델 로딩 중... 잠시만 기다려 주세요. (bge-m3, reranker, BM25)"):
             _embed_model_cached()
             _reranker_cached()
-            _qdrant_cached()
             if is_fastembed_available():
                 load_sparse_embedder()
         st.session_state.models_ready = True

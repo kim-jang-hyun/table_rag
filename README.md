@@ -4,7 +4,7 @@
 기존 RAG는 문서를 단순 텍스트로 파싱하면서 표의 행/열 관계를 파괴합니다.
 이 프로젝트는 테이블을 별도 청크로 구조화하고, LangGraph 기반으로 벡터 DB를 먼저 검색한 뒤 문서가 부족하면 웹 검색으로 폴백합니다.
 
-**배포 주소**: [https://tablerag-ci.streamlit.app](https://tablerag-ci.streamlit.app)
+**배포 주소**: [https://tablerag.streamlit.app/](https://tablerag.streamlit.app/)
 
 ---
 
