@@ -152,6 +152,7 @@ flowchart TD
 
 | 구성 요소 | 기술 | 설명 |
 |-----------|------|------|
+| 언어 | Python 3.11.9 | |
 | 에이전트 프레임워크 | LangGraph | StateGraph 기반 조건부 라우팅 |
 | 프레임워크 | LangChain | LCEL 체인, 리트리버, 리랭커 통합 |
 | Vector Store | Qdrant Cloud | 고성능 벡터 검색, 하이브리드(dense+sparse) 지원 |
