@@ -11,10 +11,15 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-# Allow ``import rag_agent`` from the same directory when running via
-# ``streamlit run app/streamlit_app.py`` (Streamlit adds the script directory
-# to sys.path automatically, but we add it explicitly for safety).
-sys.path.insert(0, str(Path(__file__).parent))
+# When running ``streamlit run app/streamlit_app.py``, Streamlit only adds
+# the script's own directory (app/) to sys.path.  We must also add the
+# project root so that ``import table_rag`` can find the package, and
+# app/ itself so that ``import rag_agent`` works without pip-installing.
+_here = Path(__file__).resolve().parent          # .../table_rag/app
+_root = _here.parent                             # .../table_rag  (project root)
+for _p in (_root, _here):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import streamlit as st
 from dotenv import load_dotenv

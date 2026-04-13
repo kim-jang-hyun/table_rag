@@ -50,6 +50,7 @@ from .config import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_COLLECTION,
     DEFAULT_OPENAI_MODEL,
+    DEFAULT_PDF,
     DEFAULT_SPARSE_MODEL,
 )
 from .document import load_document_chunks, load_pdf_chunks, load_pptx_chunks
@@ -60,6 +61,7 @@ from .retrieval import search_and_rerank
 
 __all__ = [
     # config
+    "DEFAULT_PDF",
     "DEFAULT_COLLECTION",
     "DEFAULT_OPENAI_MODEL",
     "DEFAULT_SPARSE_MODEL",

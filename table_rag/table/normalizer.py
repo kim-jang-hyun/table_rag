@@ -87,15 +87,22 @@ def combine_header_rows(row0: List[str], row1: List[str]) -> List[str]:
 
 
 def fill_rowspan_cells(body: List[List[str]]) -> List[List[str]]:
-    """Back-fill empty cells caused by PyMuPDF's rowspan representation.
+    """Fill empty cells caused by PyMuPDF's rowspan representation.
 
-    PyMuPDF places a rowspan cell's value in the *last* row of the span and
-    leaves earlier rows as empty strings.  This function propagates that value
-    backward to fill the empty slots.
+    PyMuPDF places a rowspan cell's value in the *first* row of the span and
+    leaves subsequent rows as empty strings.  A forward-fill pass propagates
+    that value downward.  A backward-fill pass then handles any remaining
+    empty cells that appear *before* the first non-empty value in a column
+    (edge case where the value lands in the last row of the span).
 
-    Example::
+    Example (value in first row — typical PyMuPDF output)::
 
-        Input:  [["",      "A-1"], ["A계열", "A-2"]]
+        Input:  [["A계열", "A-1"], ["", "A-2"]]
+        Output: [["A계열", "A-1"], ["A계열", "A-2"]]
+
+    Example (value in last row — backward-fill fallback)::
+
+        Input:  [["", "A-1"], ["A계열", "A-2"]]
         Output: [["A계열", "A-1"], ["A계열", "A-2"]]
     """
     if not body:
@@ -104,6 +111,17 @@ def fill_rowspan_cells(body: List[List[str]]) -> List[List[str]]:
     result = [list(r) + [""] * (n_cols - len(r)) for r in body]
     n_rows = len(result)
 
+    # Forward-fill: propagate each non-empty value downward to empty cells.
+    for col in range(n_cols):
+        last_val = ""
+        for i in range(n_rows):
+            if result[i][col]:
+                last_val = result[i][col]
+            elif last_val:
+                result[i][col] = last_val
+
+    # Backward-fill: handle any empties that still remain at the top of a
+    # column (value was in the last row of the span rather than the first).
     for col in range(n_cols):
         i = 0
         while i < n_rows:
@@ -117,4 +135,5 @@ def fill_rowspan_cells(body: List[List[str]]) -> List[List[str]]:
                 i = j + 1
             else:
                 i += 1
+
     return result

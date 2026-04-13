@@ -22,7 +22,15 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import List
+
+# Ensure the project root is on sys.path so ``import table_rag`` works
+# whether this module is imported by streamlit_app or run directly.
+_root = Path(__file__).resolve().parent.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
 
 from dotenv import load_dotenv
 from langchain_community.tools.tavily_search import TavilySearchResults
