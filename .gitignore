@@ -10,6 +10,8 @@ __pycache__/
 # Cursor IDE 관련
 .agents/
 skills-lock.json
+.claude/
+
 # Build / distribution artefacts
 dist/
 build/

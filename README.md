@@ -108,27 +108,26 @@ git 커밋 이력 기반 단계별 진화 과정입니다.
 flowchart TD
     subgraph ingest [인덱싱 파이프라인]
         Doc["문서\n(PDF / PPTX)"]
-        TableChunk["테이블 청크\n구조화 텍스트"]
-        TextChunk["텍스트 청크\nsize=1000 / overlap=150"]
-        Merge["교차 페이지\n표 병합"]
-        LCDoc["LangChain Documents\n+ 메타데이터"]
-        Dense["HuggingFaceEmbeddings\nBAAI/bge-m3"]
-        Sparse["FastEmbedSparse\nQdrant/bm25"]
-        Qdrant["QdrantVectorStore\nHYBRID / DENSE"]
+        TableChunk["테이블 청크"]
+        TextChunk["텍스트 청크"]
+        LCDoc["청크 데이터\n+ 메타데이터 (출처/페이지번호/타입 등)"]
+        Dense["의미 기반 임베딩\nBAAI/bge-m3"]
+        Sparse["키워드 기반 임베딩\nQdrant/bm25"]
+        Qdrant["VectorStore(Qdrant)"]
     end
 
-    subgraph agent [질문 처리 - LangGraph]
+    subgraph agent [질문 처리]
         UserQ([사용자 질문])
-        Retrieve["retrieve_node\nQdrant 검색"]
-        Grade["grade_node\n문서 품질 평가"]
-        Generate["generate_node\nRAG 답변 생성"]
-        WebRAG["web_rag_node\nTavily 웹검색"]
-        LangSmith["LangSmith\n자동 트레이싱"]
+        Retrieve["VectoreStore(Qdrant) 검색"]
+        Grade["문서 품질 평가"]
+        Generate["답변 생성\n(RAG 문서 + LLM)"]
+        WebRAG["웹검색(Tavily)"]
+        WebGenerate["답변 생성\n(Web 검색결과 + LLM)"]
     end
 
     Doc -->|"표 영역"| TableChunk
     Doc -->|"일반 텍스트"| TextChunk
-    TableChunk --> Merge --> LCDoc
+    TableChunk --> LCDoc
     TextChunk --> LCDoc
     LCDoc --> Dense & Sparse --> Qdrant
 
@@ -136,7 +135,7 @@ flowchart TD
     Grade -->|"문서 충분"| Generate
     Grade -->|"문서 부족"| WebRAG
     Qdrant --> Retrieve
-    Generate & WebRAG --> LangSmith
+    WebRAG --> WebGenerate
 ```
 
 ### 라우팅 결과 레이블 (Streamlit UI)
